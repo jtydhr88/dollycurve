@@ -36,15 +36,15 @@ export default defineConfig(({ mode }) => {
       },
     }
   }
-  // Playground (GitHub Pages) build. Hosted under
-  // https://jtydhr88.github.io/dollycurve/, so assets must resolve relative
-  // to that subpath. Override at deploy time with VITE_BASE if/when the
-  // site moves to a custom domain or its own user/org page.
+  // Playground (GitHub Pages) build. Output goes to dist-site/ — kept
+  // separate from dist/ (the npm package) so neither build wipes the
+  // other. Override the base path with VITE_BASE if/when the site moves
+  // to a custom domain or user/org page.
   return {
     root: resolve(__dirname, 'playground'),
     base: process.env.VITE_BASE ?? '/dollycurve/',
     build: {
-      outDir: resolve(__dirname, 'dist'),
+      outDir: resolve(__dirname, 'dist-site'),
       emptyOutDir: true,
     },
     resolve: {

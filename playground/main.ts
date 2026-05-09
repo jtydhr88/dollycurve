@@ -368,7 +368,7 @@ loadJsonInput.addEventListener('change', () => {
       updateTimeReadout()
       timeline.refresh()
     } catch (e) {
-      console.error('[camera-keyframe-poc] Load failed:', e)
+      console.error('[dollycurve] Load failed:', e)
       alert('Load failed: ' + (e instanceof Error ? e.message : String(e)))
     }
   }

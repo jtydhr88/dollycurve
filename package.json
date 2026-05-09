@@ -46,9 +46,10 @@
   "sideEffects": false,
   "scripts": {
     "dev": "vite",
-    "build": "vite build && vite build --mode lib",
+    "build": "vite build --mode lib",
     "build:lib": "vite build --mode lib",
     "build:playground": "vite build",
+    "build:all": "vite build --mode lib && vite build",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
