@@ -61,6 +61,30 @@ export function rnaPathSortKey (rnaPath: string): number {
   return RNA_PATH_ORDER[rnaPath] ?? 100
 }
 
+/** Group an FCurve under a collapsible category in the channel list.
+ * Mirrors how Blender's Graph Editor groups channels by bActionGroup. */
+export function channelGroup (rnaPath: string): string {
+  if (rnaPath === 'location' || rnaPath === 'rotation_euler' ||
+      rnaPath === 'rotation_quaternion' || rnaPath === 'scale') return 'Transform'
+  if (rnaPath === 'lens' || rnaPath === 'sensor_height' ||
+      rnaPath === 'shift_x' || rnaPath === 'shift_y') return 'Lens'
+  if (rnaPath === 'clip_start' || rnaPath === 'clip_end') return 'Clipping'
+  if (rnaPath.startsWith('dof.')) return 'Depth of Field'
+  return 'Other'
+}
+
+const GROUP_ORDER: Record<string, number> = {
+  Transform: 0,
+  Lens: 1,
+  Clipping: 2,
+  'Depth of Field': 3,
+  Other: 99,
+}
+
+export function channelGroupSortKey (group: string): number {
+  return GROUP_ORDER[group] ?? 50
+}
+
 /**
  * True when the rnaPath's stored values are radians (display converts to deg).
  * Quaternion components are dimensionless unit-vector parts, not angles.

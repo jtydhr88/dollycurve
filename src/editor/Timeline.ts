@@ -7,6 +7,8 @@ import { moveKeyframeTimeWithHandles } from '../editing/move'
 import { sortFCurve } from '../editing/sort'
 import { recalcAllHandles } from '../editing/handles'
 import type { SharedXView } from './GraphEditor'
+import { showSimpleMenu } from './menu'
+import { niceStep, roundRect } from './draw-utils'
 
 export interface TimelineOptions {
   container: HTMLElement
@@ -499,12 +501,14 @@ export class Timeline {
   private beginKeyframeDrag (mx: number, my: number, frame: number): void {
     const affected: { fcu: FCurve; bezt: FCurve['bezt'][number]; t0: number }[] = []
     for (const fcu of this.action.fcurves) {
+      if (fcu.locked) continue  // FCURVE_PROTECTED
       for (const b of fcu.bezt) {
         if (Math.abs(b.vec[1][0] - frame) < 1e-3) {
           affected.push({ fcu, bezt: b, t0: b.vec[1][0] })
         }
       }
     }
+    if (affected.length === 0) return
     this.dragging = {
       kind: 'keyframe', startX: mx, startY: my,
       draggedFrame: frame, affected,
@@ -607,115 +611,3 @@ export class Timeline {
   }
 }
 
-function niceStep (raw: number): number {
-  if (raw <= 0) return 1
-  const exp = Math.floor(Math.log10(raw))
-  const f = raw / Math.pow(10, exp)
-  let nice: number
-  if (f < 1.5) nice = 1
-  else if (f < 3) nice = 2
-  else if (f < 7) nice = 5
-  else nice = 10
-  return nice * Math.pow(10, exp)
-}
-
-/** Lightweight DOM context menu. One-level only — use
- * `separator: true` to draw a divider; an entry with no `action` renders
- * as a section label. */
-export interface MenuItem {
-  label?: string
-  action?: () => void
-  separator?: boolean
-  disabled?: boolean
-}
-
-const MENU_STYLE_ID = 'ckp-menu-style'
-const MENU_STYLE = `
-.ckp-menu {
-  position: fixed; z-index: 9999;
-  background: #2a2a30; border: 1px solid #444; border-radius: 4px;
-  padding: 4px 0; min-width: 180px;
-  font: 12px system-ui, sans-serif; color: #ddd;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-  user-select: none;
-}
-.ckp-menu-item { padding: 4px 14px; cursor: pointer; }
-.ckp-menu-item:hover { background: #3a3a44; color: #fff; }
-.ckp-menu-item.disabled { color: #666; cursor: default; }
-.ckp-menu-item.disabled:hover { background: transparent; color: #666; }
-.ckp-menu-section { padding: 4px 14px 2px; color: #777; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; cursor: default; }
-.ckp-menu-sep { height: 1px; background: #3a3a44; margin: 4px 0; }
-`
-
-export function showSimpleMenu (clientX: number, clientY: number, items: MenuItem[]): void {
-  if (!document.getElementById(MENU_STYLE_ID)) {
-    const tag = document.createElement('style')
-    tag.id = MENU_STYLE_ID
-    tag.textContent = MENU_STYLE
-    document.head.appendChild(tag)
-  }
-  document.querySelectorAll('.ckp-menu').forEach((m) => m.remove())
-
-  const menu = document.createElement('div')
-  menu.className = 'ckp-menu'
-  for (const it of items) {
-    if (it.separator) {
-      const s = document.createElement('div')
-      s.className = 'ckp-menu-sep'
-      menu.appendChild(s)
-      continue
-    }
-    if (!it.action) {
-      const s = document.createElement('div')
-      s.className = 'ckp-menu-section'
-      s.textContent = it.label ?? ''
-      menu.appendChild(s)
-      continue
-    }
-    const div = document.createElement('div')
-    div.className = 'ckp-menu-item' + (it.disabled ? ' disabled' : '')
-    div.textContent = it.label ?? ''
-    if (!it.disabled) {
-      div.addEventListener('click', () => {
-        it.action!()
-        menu.remove()
-      })
-    }
-    menu.appendChild(div)
-  }
-  document.body.appendChild(menu)
-
-  const rect = menu.getBoundingClientRect()
-  const px = Math.min(clientX, window.innerWidth - rect.width - 8)
-  const py = Math.min(clientY, window.innerHeight - rect.height - 8)
-  menu.style.left = px + 'px'
-  menu.style.top = py + 'px'
-
-  const close = (e: MouseEvent | KeyboardEvent) => {
-    if (e instanceof KeyboardEvent && e.key !== 'Escape') return
-    if (e instanceof MouseEvent && menu.contains(e.target as Node)) return
-    menu.remove()
-    window.removeEventListener('mousedown', close as EventListener)
-    window.removeEventListener('keydown', close as EventListener)
-  }
-  // Defer attach so the originating event doesn't immediately close.
-  setTimeout(() => {
-    window.addEventListener('mousedown', close as EventListener)
-    window.addEventListener('keydown', close as EventListener)
-  }, 0)
-}
-
-function roundRect (ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
-  const rr = Math.min(r, w / 2, h / 2)
-  ctx.beginPath()
-  ctx.moveTo(x + rr, y)
-  ctx.lineTo(x + w - rr, y)
-  ctx.quadraticCurveTo(x + w, y, x + w, y + rr)
-  ctx.lineTo(x + w, y + h - rr)
-  ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h)
-  ctx.lineTo(x + rr, y + h)
-  ctx.quadraticCurveTo(x, y + h, x, y + h - rr)
-  ctx.lineTo(x, y + rr)
-  ctx.quadraticCurveTo(x, y, x + rr, y)
-  ctx.closePath()
-}

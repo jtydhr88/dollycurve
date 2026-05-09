@@ -20,6 +20,9 @@ export interface SimplePanelOptions {
   getCurrentFrame: () => number
   /** Called after any panel-driven mutation; host should refresh its viewport. */
   onChanged?: () => void
+  /** Fired once per user-intent COMMAND (input change / button click) so
+   * callers can push undo steps. Same contract as GraphEditor.onCommit. */
+  onCommit?: (label: string) => void
   /** Optional jump-to-frame; enables a "go" button per key. */
   setCurrentFrame?: (frame: number) => void
 }
@@ -99,6 +102,7 @@ export class SimplePanel {
   private getCurrentFrame: () => number
   private setCurrentFrame: ((f: number) => void) | undefined
   private onChanged: () => void
+  private onCommit: (label: string) => void
 
   constructor (opts: SimplePanelOptions) {
     this.container = opts.container
@@ -106,6 +110,7 @@ export class SimplePanel {
     this.getCurrentFrame = opts.getCurrentFrame
     this.setCurrentFrame = opts.setCurrentFrame
     this.onChanged = opts.onChanged ?? (() => {})
+    this.onCommit = opts.onCommit ?? (() => {})
 
     this.injectStyle()
     this.container.classList.add('ckp-panel')
@@ -160,7 +165,7 @@ export class SimplePanel {
       const frame = this.getCurrentFrame()
       const value = evaluateFCurve(fcu, frame)
       insertOrReplaceKeyframe(fcu, frame, value)
-      this.fireChanged()
+      this.fireChanged('panel: + key')
     })
     header.appendChild(addBtn)
 
@@ -170,7 +175,7 @@ export class SimplePanel {
     removeBtn.addEventListener('click', () => {
       const i = this.action.fcurves.indexOf(fcu)
       if (i >= 0) this.action.fcurves.splice(i, 1)
-      this.fireChanged()
+      this.fireChanged('panel: remove channel')
     })
     header.appendChild(removeBtn)
     channel.appendChild(header)
@@ -198,7 +203,7 @@ export class SimplePanel {
       const seconds = parseFloat(timeInput.value)
       if (!Number.isFinite(seconds)) return this.refresh()
       moveKeyframe(fcu, idx, seconds * fps)
-      this.fireChanged()
+      this.fireChanged('panel: edit time')
     })
     row.appendChild(timeInput)
 
@@ -210,7 +215,7 @@ export class SimplePanel {
       const v = parseValue(fcu.rnaPath, valueInput.value)
       if (v === null) return this.refresh()
       moveKeyframe(fcu, idx, bezt.vec[1][0], v)
-      this.fireChanged()
+      this.fireChanged('panel: edit value')
     })
     row.appendChild(valueInput)
 
@@ -224,7 +229,7 @@ export class SimplePanel {
     }
     ipoSelect.addEventListener('change', () => {
       bezt.ipo = ipoSelect.value as Interpolation
-      this.fireChanged()
+      this.fireChanged('panel: set ipo')
     })
     row.appendChild(ipoSelect)
 
@@ -240,7 +245,7 @@ export class SimplePanel {
       }
       easingSelect.addEventListener('change', () => {
         bezt.easing = easingSelect.value as Easing
-        this.fireChanged()
+        this.fireChanged('panel: set easing')
       })
       row.appendChild(easingSelect)
     } else {
@@ -266,7 +271,7 @@ export class SimplePanel {
       bezt.h1 = h
       bezt.h2 = h
       recalcHandlesAround(fcu, idx)
-      this.fireChanged()
+      this.fireChanged('panel: set handle')
     })
     row.appendChild(handleSelect)
 
@@ -287,15 +292,16 @@ export class SimplePanel {
     delBtn.title = 'Delete this key'
     delBtn.addEventListener('click', () => {
       deleteKeyframe(fcu, idx)
-      this.fireChanged()
+      this.fireChanged('panel: delete key')
     })
     row.appendChild(delBtn)
 
     return row
   }
 
-  private fireChanged (): void {
+  private fireChanged (label?: string): void {
     this.onChanged()
+    if (label) this.onCommit(label)
     this.refresh()
   }
 

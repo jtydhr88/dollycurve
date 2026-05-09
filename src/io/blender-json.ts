@@ -20,6 +20,11 @@ import {
   CyclesModifier,
   FCurve,
   FModifier,
+  NoiseModifier,
+  PathFollowConstraint,
+  SplinePath,
+  SplinePoint,
+  Vec3,
 } from '../data/types'
 
 export const SCHEMA_VERSION = 1
@@ -29,6 +34,31 @@ export interface CameraActionJson {
   fps: number
   fcurves: FCurveJson[]
   metadata?: CameraActionMetadataJson
+  pathFollow?: PathFollowConstraintJson
+}
+
+export interface SplinePointJson {
+  co: [number, number, number]
+  h1: [number, number, number]
+  h2: [number, number, number]
+  tilt?: number
+}
+
+export interface SplinePathJson {
+  type: 'bezier'
+  points: SplinePointJson[]
+  closed: boolean
+  resolution?: number
+}
+
+export interface PathFollowConstraintJson {
+  splinePath: SplinePathJson
+  speedCurve?: FCurveJson
+  orientation: 'tangent' | 'lookAt' | 'free'
+  lookAtTarget?: [number, number, number]
+  tiltCurve?: FCurveJson
+  upAxis: 'X' | 'Y' | 'Z' | [number, number, number]
+  arcLengthUniform: boolean
 }
 
 export interface CameraActionMetadataJson {
@@ -50,16 +80,35 @@ export interface FCurveJson {
   discrete: boolean
   modifiers: ModifierJson[]
   keyframes: BezTripleJson[]
+  muted?: boolean
+  locked?: boolean
 }
 
-export type ModifierJson = CyclesModifierJson
+export type ModifierJson = CyclesModifierJson | NoiseModifierJson
 
-export interface CyclesModifierJson {
+export interface FModifierBaseJson {
+  muted?: boolean
+  influence?: number
+}
+
+export interface CyclesModifierJson extends FModifierBaseJson {
   type: 'cycles'
   before: string
   after: string
   beforeCount: number
   afterCount: number
+}
+
+export interface NoiseModifierJson extends FModifierBaseJson {
+  type: 'noise'
+  modification: 'replace' | 'add' | 'sub' | 'mul'
+  size: number
+  strength: number
+  phase: number
+  offset: number
+  depth: number
+  lacunarity: number
+  roughness: number
 }
 
 export interface BezTripleJson {
@@ -81,6 +130,40 @@ export function exportCameraActionToJson (action: CameraAction): CameraActionJso
     fcurves: action.fcurves.map(fcurveToJson),
   }
   if (action.metadata) out.metadata = metadataToJson(action.metadata)
+  if (action.pathFollow) out.pathFollow = pathFollowToJson(action.pathFollow)
+  return out
+}
+
+function pathFollowToJson (pf: PathFollowConstraint): PathFollowConstraintJson {
+  const out: PathFollowConstraintJson = {
+    splinePath: splinePathToJson(pf.splinePath),
+    orientation: pf.orientation,
+    upAxis: Array.isArray(pf.upAxis) ? [pf.upAxis[0], pf.upAxis[1], pf.upAxis[2]] : pf.upAxis,
+    arcLengthUniform: pf.arcLengthUniform,
+  }
+  if (pf.speedCurve) out.speedCurve = fcurveToJson(pf.speedCurve)
+  if (pf.tiltCurve) out.tiltCurve = fcurveToJson(pf.tiltCurve)
+  if (pf.lookAtTarget) out.lookAtTarget = [pf.lookAtTarget[0], pf.lookAtTarget[1], pf.lookAtTarget[2]]
+  return out
+}
+
+function splinePathToJson (path: SplinePath): SplinePathJson {
+  const out: SplinePathJson = {
+    type: 'bezier',
+    points: path.points.map(splinePointToJson),
+    closed: path.closed,
+  }
+  if (path.resolution !== undefined) out.resolution = path.resolution
+  return out
+}
+
+function splinePointToJson (p: SplinePoint): SplinePointJson {
+  const out: SplinePointJson = {
+    co: [p.co[0], p.co[1], p.co[2]],
+    h1: [p.h1[0], p.h1[1], p.h1[2]],
+    h2: [p.h2[0], p.h2[1], p.h2[2]],
+  }
+  if (p.tilt !== undefined && p.tilt !== 0) out.tilt = p.tilt
   return out
 }
 
@@ -106,7 +189,7 @@ function metadataToJson (m: CameraActionMetadata): CameraActionMetadataJson {
 }
 
 function fcurveToJson (fcu: FCurve): FCurveJson {
-  return {
+  const out: FCurveJson = {
     rnaPath: fcu.rnaPath,
     arrayIndex: fcu.arrayIndex,
     extend: fcu.extend,
@@ -115,17 +198,37 @@ function fcurveToJson (fcu: FCurve): FCurveJson {
     modifiers: fcu.modifiers.map(modifierToJson),
     keyframes: fcu.bezt.map(beztToJson),
   }
+  if (fcu.muted) out.muted = true
+  if (fcu.locked) out.locked = true
+  return out
 }
 
 function modifierToJson (m: FModifier): ModifierJson {
+  const base: FModifierBaseJson = {}
+  if (m.muted) base.muted = true
+  if (m.influence !== undefined && m.influence !== 1) base.influence = m.influence
   switch (m.type) {
     case 'cycles':
       return {
+        ...base,
         type: 'cycles',
         before: m.before,
         after: m.after,
         beforeCount: m.beforeCount,
         afterCount: m.afterCount,
+      }
+    case 'noise':
+      return {
+        ...base,
+        type: 'noise',
+        modification: m.modification,
+        size: m.size,
+        strength: m.strength,
+        phase: m.phase,
+        offset: m.offset,
+        depth: m.depth,
+        lacunarity: m.lacunarity,
+        roughness: m.roughness,
       }
   }
 }
@@ -162,7 +265,86 @@ export function importCameraActionFromJson (raw: unknown): CameraAction {
   if (data.metadata !== undefined && data.metadata !== null) {
     action.metadata = metadataFromJson(data.metadata, 'metadata')
   }
+  if (data.pathFollow !== undefined && data.pathFollow !== null) {
+    action.pathFollow = pathFollowFromJson(data.pathFollow, 'pathFollow')
+  }
   return action
+}
+
+function pathFollowFromJson (raw: unknown, path: string): PathFollowConstraint {
+  const o = expectObject(raw, path)
+  const splinePath = splinePathFromJson(o.splinePath, `${path}.splinePath`)
+  const orientation = expectString(o.orientation, `${path}.orientation`)
+  if (orientation !== 'tangent' && orientation !== 'lookAt' && orientation !== 'free') {
+    throw new Error(`${path}.orientation: unsupported "${orientation}"`)
+  }
+  let upAxis: PathFollowConstraint['upAxis']
+  if (typeof o.upAxis === 'string') {
+    if (o.upAxis !== 'X' && o.upAxis !== 'Y' && o.upAxis !== 'Z') {
+      throw new Error(`${path}.upAxis: unsupported "${o.upAxis}"`)
+    }
+    upAxis = o.upAxis
+  } else {
+    const arr = expectArray(o.upAxis, `${path}.upAxis`)
+    if (arr.length !== 3) throw new Error(`${path}.upAxis: expected length 3`)
+    upAxis = [
+      expectFiniteNumber(arr[0], `${path}.upAxis[0]`),
+      expectFiniteNumber(arr[1], `${path}.upAxis[1]`),
+      expectFiniteNumber(arr[2], `${path}.upAxis[2]`),
+    ]
+  }
+  const out: PathFollowConstraint = {
+    splinePath,
+    orientation,
+    upAxis,
+    arcLengthUniform: expectBoolean(o.arcLengthUniform, `${path}.arcLengthUniform`),
+  }
+  if (o.speedCurve !== undefined) out.speedCurve = fcurveFromJson(o.speedCurve, `${path}.speedCurve`)
+  if (o.tiltCurve !== undefined) out.tiltCurve = fcurveFromJson(o.tiltCurve, `${path}.tiltCurve`)
+  if (o.lookAtTarget !== undefined) {
+    const arr = expectArray(o.lookAtTarget, `${path}.lookAtTarget`)
+    if (arr.length !== 3) throw new Error(`${path}.lookAtTarget: expected length 3`)
+    out.lookAtTarget = [
+      expectFiniteNumber(arr[0], `${path}.lookAtTarget[0]`),
+      expectFiniteNumber(arr[1], `${path}.lookAtTarget[1]`),
+      expectFiniteNumber(arr[2], `${path}.lookAtTarget[2]`),
+    ]
+  }
+  return out
+}
+
+function splinePathFromJson (raw: unknown, path: string): SplinePath {
+  const o = expectObject(raw, path)
+  if (o.type !== 'bezier') throw new Error(`${path}.type: expected 'bezier', got "${String(o.type)}"`)
+  const pointsArr = expectArray(o.points, `${path}.points`)
+  const points = pointsArr.map((p, i) => splinePointFromJson(p, `${path}.points[${i}]`))
+  const out: SplinePath = {
+    type: 'bezier',
+    points,
+    closed: expectBoolean(o.closed, `${path}.closed`),
+  }
+  if (o.resolution !== undefined) out.resolution = expectFiniteNumber(o.resolution, `${path}.resolution`)
+  return out
+}
+
+function splinePointFromJson (raw: unknown, path: string): SplinePoint {
+  const o = expectObject(raw, path)
+  const readVec3 = (v: unknown, p: string): Vec3 => {
+    const arr = expectArray(v, p)
+    if (arr.length !== 3) throw new Error(`${p}: expected length 3`)
+    return [
+      expectFiniteNumber(arr[0], `${p}[0]`),
+      expectFiniteNumber(arr[1], `${p}[1]`),
+      expectFiniteNumber(arr[2], `${p}[2]`),
+    ]
+  }
+  const out: SplinePoint = {
+    co: readVec3(o.co, `${path}.co`),
+    h1: readVec3(o.h1, `${path}.h1`),
+    h2: readVec3(o.h2, `${path}.h2`),
+  }
+  if (o.tilt !== undefined) out.tilt = expectFiniteNumber(o.tilt, `${path}.tilt`)
+  return out
 }
 
 function metadataFromJson (raw: unknown, path: string): CameraActionMetadata {
@@ -232,20 +414,45 @@ function fcurveFromJson (raw: unknown, path: string): FCurve {
     discrete,
     modifiers,
   })
+  if (o.muted !== undefined && expectBoolean(o.muted, `${path}.muted`)) fcu.muted = true
+  if (o.locked !== undefined && expectBoolean(o.locked, `${path}.locked`)) fcu.locked = true
   return fcu
 }
 
 function modifierFromJson (raw: unknown, path: string): FModifier {
   const o = expectObject(raw, path)
   const type = expectString(o.type, `${path}.type`)
+  const base: { muted?: boolean; influence?: number } = {}
+  if (o.muted !== undefined) base.muted = expectBoolean(o.muted, `${path}.muted`)
+  if (o.influence !== undefined) base.influence = expectFiniteNumber(o.influence, `${path}.influence`)
   switch (type) {
     case 'cycles': {
       const m: CyclesModifier = {
+        ...base,
         type: 'cycles',
         before: expectEnum(o.before, CycleMode, `${path}.before`),
         after: expectEnum(o.after, CycleMode, `${path}.after`),
         beforeCount: expectFiniteNumber(o.beforeCount, `${path}.beforeCount`),
         afterCount: expectFiniteNumber(o.afterCount, `${path}.afterCount`),
+      }
+      return m
+    }
+    case 'noise': {
+      const mode = expectString(o.modification, `${path}.modification`)
+      if (mode !== 'replace' && mode !== 'add' && mode !== 'sub' && mode !== 'mul') {
+        throw new Error(`${path}.modification: unsupported "${mode}"`)
+      }
+      const m: NoiseModifier = {
+        ...base,
+        type: 'noise',
+        modification: mode,
+        size: expectFiniteNumber(o.size, `${path}.size`),
+        strength: expectFiniteNumber(o.strength, `${path}.strength`),
+        phase: expectFiniteNumber(o.phase, `${path}.phase`),
+        offset: expectFiniteNumber(o.offset, `${path}.offset`),
+        depth: expectFiniteNumber(o.depth, `${path}.depth`),
+        lacunarity: expectFiniteNumber(o.lacunarity, `${path}.lacunarity`),
+        roughness: expectFiniteNumber(o.roughness, `${path}.roughness`),
       }
       return m
     }

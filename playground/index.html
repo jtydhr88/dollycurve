@@ -17,7 +17,7 @@
         grid-template-rows: 1fr auto;
         grid-template-areas:
           "viewport sidebar"
-          "bottom   sidebar";
+          "bottom   bottom";
         height: 100vh;
         gap: 1px;
         background: #0e0e10;  /* shows through as 1px borders between editors */
@@ -31,24 +31,105 @@
 
       #panel {
         grid-area: sidebar;
-        display: flex; flex-direction: column;
         background: #232328;
-        padding: 10px; font-size: 13px;
+        border-left: 1px solid #0e0e10;
+        padding: 8px 10px; font: 13px system-ui, sans-serif; color: #ddd;
+        overflow: hidden;  /* collapsed-state width clamp */
+        min-height: 0;  /* allow children to flex within the grid cell */
       }
-      #panel h2 { margin: 0 0 8px; font-size: 14px; color: #fff; font-weight: 600; }
-      #panel .row { display: flex; gap: 6px; align-items: center; margin: 6px 0; }
+      /* Make the open <details> a flex column so #panel-body gets the
+         remaining height after the summary, and #keyframes can scroll. */
+      #panel[open] {
+        display: flex; flex-direction: column; height: 100%;
+      }
+      #panel summary {
+        cursor: pointer; outline: none; list-style: none;
+        display: flex; align-items: center; gap: 6px;
+        padding: 2px 0;
+      }
+      #panel summary::-webkit-details-marker { display: none; }
+      #panel summary::marker { content: ''; }
+      #panel summary b { color: #fff; font-size: 13px; font-weight: 600; }
+      #panel summary::after { content: '▾'; color: #888; margin-left: auto; font-size: 11px; }
+      /* Collapsed: render the summary vertically so the label fits in
+         the 32px-wide strip. */
+      #panel:not([open]) summary {
+        writing-mode: vertical-rl; text-orientation: mixed;
+        padding: 10px 6px; gap: 8px;
+        height: 100%;  /* fills the sidebar grid cell */
+      }
+      #panel:not([open]) summary::after { content: '◂'; margin-left: 0; margin-top: auto; transform: rotate(90deg); }
+      #panel:not([open]) summary b { letter-spacing: 0.06em; }
+      #panel-body {
+        flex: 1; display: flex; flex-direction: column;
+        padding-top: 6px;
+        min-height: 0;  /* allow inner #keyframes to scroll */
+      }
+      #panel:not([open]) #panel-body { display: none; }
+      #panel h2 { margin: 12px 0 6px; font-size: 12px; color: #999; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
+      #panel .row { display: flex; gap: 6px; align-items: center; margin: 6px 0; flex-wrap: wrap; }
       #panel button {
         background: #2c2c33; color: #ddd; border: 1px solid #3a3a42; border-radius: 3px;
         padding: 4px 10px; font-size: 12px; cursor: pointer;
       }
       #panel button:hover { background: #353540; }
+      #panel button:disabled { opacity: 0.4; cursor: not-allowed; }
+      #panel button:disabled:hover { background: #2c2c33; }
       #panel button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
       #panel button.primary:hover { background: #1d4fd8; }
-      #panel h2 { margin: 0 0 8px; font-size: 12px; color: #999; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
-      #panel input[type="number"] { width: 60px; background: #1f1f23; color: #ddd; border: 1px solid #333; border-radius: 4px; padding: 3px 6px; }
+      #panel input[type="number"] {
+        width: 60px; background: #1f1f23; color: #ddd; border: 1px solid #333;
+        border-radius: 4px; padding: 3px 6px;
+      }
       #panel label { font-size: 12px; color: #aaa; }
 
-      #keyframes { flex: 1; overflow-y: auto; margin-top: 8px; padding-top: 4px; }
+      #keyframes {
+        flex: 1; overflow-y: auto; overflow-x: hidden;
+        margin-top: 6px; padding-top: 4px;
+        min-height: 0;  /* required for flex-child scroll */
+      }
+
+      /* Layout adapts when the right panel is collapsed: zero out the
+         sidebar column (panel pops out as an absolute floater, see below)
+         so the viewport gets the whole top-row width. */
+      #layout.panel-collapsed { grid-template-columns: 1fr 0; }
+      /* Collapsed panel: floating pill at top-right, like the help panel
+         on the left. Anchored to canvas-host so it doesn't overlap the
+         bottom timeline row. */
+      #panel:not([open]) {
+        grid-area: unset;
+        position: absolute; top: 8px; right: 8px; z-index: 10;
+        width: auto; height: auto;
+        padding: 4px 10px; border-radius: 4px;
+        background: rgba(35,35,40,0.92);
+        border: 1px solid #444;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+      }
+      #panel:not([open]) summary {
+        writing-mode: horizontal-tb;
+        padding: 2px 0; gap: 6px; height: auto;
+      }
+      #panel:not([open]) summary::after {
+        content: '◂'; margin: 0 0 0 4px; transform: none;
+      }
+
+      /* Make the 5-field key row shrink to fit the panel width — the
+         lib's default 56px/64px/60px/70px/56px fixed columns overflow
+         the 340px sidebar. minmax(0,1fr) lets every column collapse and
+         distributes the remaining width evenly; the trailing go/× cells
+         stay auto-sized. */
+      #panel .ckp-key {
+        grid-template-columns: minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) auto auto;
+      }
+      #panel .ckp-key input,
+      #panel .ckp-key select {
+        width: 100%; min-width: 0; box-sizing: border-box;
+      }
+      #panel .ckp-key select {
+        text-overflow: ellipsis; appearance: none; -webkit-appearance: none;
+        padding-right: 4px;  /* drop the native arrow gutter */
+      }
+      #panel #keyframes { overflow-x: hidden; }
 
       #bottom { grid-area: bottom; display: flex; flex-direction: column; min-height: 0; }
       #scrubber-bar {
@@ -64,6 +145,8 @@
       #scrubber-bar button.active { background: #2a3845; border-color: #3a4855; color: #fff; }
       #scrubber-bar button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
       #scrubber-bar button.primary:hover { background: #1d4fd8; }
+      #scrubber-bar button:disabled { opacity: 0.4; cursor: not-allowed; }
+      #scrubber-bar button:disabled:hover { background: #2c2c33; }
       #scrubber-bar .ckp-divider { width: 1px; height: 18px; background: #3a3a42; margin: 0 2px; }
       #scrubber-bar #time-readout { font-family: ui-monospace, monospace; color: #6cf; font-size: 11px; padding: 0 6px; }
       #scrubber-bar .ckp-inline-label {
@@ -98,31 +181,105 @@
       #graph-host { flex: 1; min-height: 0; }
       #help {
         position: absolute; left: 8px; top: 8px;
-        font-size: 11px; color: #888; line-height: 1.5;
-        background: rgba(20,20,24,0.6); padding: 6px 8px; border-radius: 3px;
+        font: 11px ui-monospace, monospace; color: #ccc; line-height: 1.5;
+        background: rgba(35,35,40,0.92); padding: 6px 10px; border-radius: 4px;
+        border: 1px solid #444;
         pointer-events: none;
+        max-width: 380px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.5);
       }
-      #help b { color: #ddd; }
+      #help summary { pointer-events: auto; cursor: pointer; outline: none; list-style: none; }
+      #help summary::-webkit-details-marker { display: none; }
+      #help summary::marker { content: ''; }
+      #help[open] summary { margin-bottom: 4px; }
+      #help summary b { color: #fff; font-size: 12px; font-family: system-ui, sans-serif; }
+      #help summary::after {
+        content: ' ▾'; color: #888; font-size: 10px;
+      }
+      #help[open] summary::after { content: ' ▴'; }
+      #help .help-section { margin-top: 2px; display: flex; gap: 8px; }
+      #help .help-key {
+        color: #6cf; font-weight: 600; min-width: 60px; flex-shrink: 0;
+        font-family: system-ui, sans-serif;
+      }
+      #help .help-keys { color: #ddd; }
+      #help kbd {
+        background: #1f1f23; border: 1px solid #444; border-radius: 2px;
+        padding: 0 4px; font-size: 10px; color: #ddd;
+        box-shadow: 0 1px 0 rgba(0,0,0,0.5);
+      }
+
+      /* Inline gizmo controls in the scrubber bar. */
+      #gizmo-radios { display: inline-flex; gap: 6px; align-items: center; }
+      #gizmo-radios.disabled { opacity: 0.4; pointer-events: none; }
+      #gizmo-radios label { font-size: 11px; color: #aaa; cursor: pointer; }
+      #gizmo-radios input[type="radio"] { margin: 0 2px 0 0; vertical-align: middle; }
     </style>
 </head>
 <body>
     <div id="layout">
       <div id="canvas-host">
-        <div id="help">
-          <b>dollycurve</b><br/>
-          Drag = orbit · Right-drag = pan · Scroll = zoom · K = keyframe @ T
+        <details id="help" open>
+          <summary><b>dollycurve</b></summary>
+          <div class="help-section">
+            <span class="help-key">Viewport</span>
+            <span class="help-keys">drag = orbit · RMB-drag = pan · scroll = zoom</span>
+          </div>
+          <div class="help-section">
+            <span class="help-key">Keyframe</span>
+            <span class="help-keys"><kbd>K</kbd> add @ playhead · <kbd>↑</kbd>/<kbd>↓</kbd> next/prev key</span>
+          </div>
+          <div class="help-section">
+            <span class="help-key">Gizmo</span>
+            <span class="help-keys">click cam helper · <kbd>G</kbd> move · <kbd>R</kbd> rotate · <kbd>Esc</kbd> deselect</span>
+          </div>
+          <div class="help-section">
+            <span class="help-key">Graph</span>
+            <span class="help-keys"><kbd>A</kbd> select all · <kbd>X</kbd> delete · <kbd>T</kbd>/<kbd>V</kbd> cycle ipo/handle · <kbd>F</kbd>/<kbd>Shift+F</kbd> frame all/sel · <kbd>Shift+K</kbd> column</span>
+          </div>
+          <div class="help-section">
+            <span class="help-key">Edit</span>
+            <span class="help-keys"><kbd>Ctrl+Z</kbd> undo · <kbd>Ctrl+Shift+Z</kbd> redo · auto-saves to browser</span>
+          </div>
+        </details>
+      </div>
+      <details id="panel" open>
+        <summary><b>Camera Keyframes</b></summary>
+        <div id="panel-body">
+          <div class="row">
+            <button id="undo-btn" title="Undo (Ctrl+Z)" disabled>↶ Undo</button>
+            <button id="redo-btn" title="Redo (Ctrl+Shift+Z / Ctrl+Y)" disabled>↷ Redo</button>
+          </div>
+          <div class="row">
+            <button id="load-json">Load JSON…</button>
+            <button id="save-json">Save JSON</button>
+            <input id="load-json-input" type="file" accept=".json,application/json" style="display:none" />
+            <button id="clear-kf">Clear all</button>
+          </div>
+          <!-- Path mode UI hidden until the spline editor is more polished;
+               implementation stays wired (main.ts still listens to these
+               controls when they exist). Re-enable by removing the wrapper. -->
+          <div style="display: none;">
+            <h2 style="margin-top: 14px;">Path Mode</h2>
+            <div class="row">
+              <label class="ckp-inline-label" style="font-size: 12px; color: #ddd;">
+                <input id="path-mode" type="checkbox" /> Edit as 3D spline
+              </label>
+            </div>
+            <div class="row" style="gap: 6px; align-items: center;">
+              <button id="fit-path" title="Fit a spline through existing location FCurves" style="min-width: 100px;">Fit → Path</button>
+              <label class="ckp-inline-label" style="font-size: 11px; color: #aaa;">anchors</label>
+              <input id="fit-count" type="number" min="2" max="100" step="1" value="5" style="width: 50px;" />
+            </div>
+            <div class="row" id="path-controls" style="display: none; gap: 6px; align-items: center;">
+              <button id="bake-path" title="Sample path → location/rotation FCurves" style="min-width: 100px;">Bake → FCurves</button>
+              <label class="ckp-inline-label" style="font-size: 11px; color: #aaa;">keys</label>
+              <input id="bake-count" type="number" min="2" max="500" step="1" value="20" style="width: 50px;" />
+            </div>
+          </div>
+          <div id="keyframes"></div>
         </div>
-      </div>
-      <div id="panel">
-      <h2>Camera Keyframes</h2>
-      <div class="row">
-        <button id="load-json">Load JSON…</button>
-        <button id="save-json">Save JSON</button>
-        <input id="load-json-input" type="file" accept=".json,application/json" style="display:none" />
-        <button id="clear-kf">Clear all</button>
-      </div>
-      <div id="keyframes"></div>
-    </div>
+      </details>
 
       <div id="bottom">
         <div id="timeline-bar">
@@ -141,12 +298,20 @@
           <button id="play" title="Play / Pause">▶</button>
           <button id="next-key" title="Jump to next keyframe (Up)">⏩</button>
           <div class="ckp-divider"></div>
-          <button id="add-kf" class="primary" title="Capture all from camera at current time (K)">+ Keyframe</button>
+          <button id="add-kf" class="primary" title="Capture editor camera (orbit) at current time (K)">+ Keyframe</button>
+          <button id="add-kf-live" title="Capture the live-preview cam (orange frustum) at current time. Useful for converting a path-driven pose into a discrete keyframe.">+ KF (live)</button>
           <span style="flex:1"></span>
           <label class="ckp-inline-label">End</label>
           <input id="end-frame" type="number" min="1" max="10000" step="1" value="250" />
           <div class="ckp-divider"></div>
+          <label class="ckp-inline-label"><input id="show-helper" type="checkbox" checked /> Cam helper</label>
           <label class="ckp-inline-label"><input id="preview-toggle" type="checkbox" /> Preview cam</label>
+          <div class="ckp-divider"></div>
+          <label class="ckp-inline-label"><input id="gizmo-enable" type="checkbox" /> Gizmo</label>
+          <span id="gizmo-radios" class="disabled">
+            <label><input type="radio" name="gizmo-mode" id="gizmo-translate" checked /> Move</label>
+            <label><input type="radio" name="gizmo-mode" id="gizmo-rotate" /> Rotate</label>
+          </span>
           <div class="ckp-divider"></div>
           <span id="time-readout">0 / 250  ·  0.00s</span>
         </div>

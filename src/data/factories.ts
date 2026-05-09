@@ -12,6 +12,11 @@ import {
   CameraAction,
   CyclesModifier,
   FCurve,
+  NoiseModifier,
+  PathFollowConstraint,
+  SplinePath,
+  SplinePoint,
+  Vec3,
 } from './types'
 
 export interface MakeBezTripleOpts {
@@ -93,4 +98,59 @@ export function makeCyclesModifier (
   afterCount: number = 0,
 ): CyclesModifier {
   return { type: 'cycles', before, after, beforeCount, afterCount }
+}
+
+export function makeNoiseModifier (opts: Partial<Omit<NoiseModifier, 'type'>> = {}): NoiseModifier {
+  return {
+    type: 'noise',
+    modification: opts.modification ?? 'replace',
+    size: opts.size ?? 1,
+    strength: opts.strength ?? 1,
+    phase: opts.phase ?? 0,
+    offset: opts.offset ?? 0,
+    depth: opts.depth ?? 0,
+    lacunarity: opts.lacunarity ?? 2,
+    roughness: opts.roughness ?? 0.5,
+    ...(opts.muted !== undefined && { muted: opts.muted }),
+    ...(opts.influence !== undefined && { influence: opts.influence }),
+  }
+}
+
+/** Make a SplinePoint at `co` with auto handles aligned to the tangent
+ * vector `tan`. If `tan` is zero, handles default to (1,0,0). */
+export function makeSplinePoint (co: Vec3, tan: Vec3 = [1, 0, 0], handleLen = 1, tilt = 0): SplinePoint {
+  const len = Math.hypot(tan[0], tan[1], tan[2])
+  const t: Vec3 = len > 0
+    ? [tan[0] / len * handleLen, tan[1] / len * handleLen, tan[2] / len * handleLen]
+    : [handleLen, 0, 0]
+  return {
+    co: [co[0], co[1], co[2]],
+    h1: [co[0] - t[0], co[1] - t[1], co[2] - t[2]],
+    h2: [co[0] + t[0], co[1] + t[1], co[2] + t[2]],
+    ...(tilt !== 0 && { tilt }),
+  }
+}
+
+export function makeSplinePath (points: SplinePoint[], opts: { closed?: boolean; resolution?: number } = {}): SplinePath {
+  return {
+    type: 'bezier',
+    points,
+    closed: opts.closed ?? false,
+    ...(opts.resolution !== undefined && { resolution: opts.resolution }),
+  }
+}
+
+export function makePathFollowConstraint (
+  splinePath: SplinePath,
+  opts: Partial<Omit<PathFollowConstraint, 'splinePath'>> = {},
+): PathFollowConstraint {
+  return {
+    splinePath,
+    orientation: opts.orientation ?? 'tangent',
+    upAxis: opts.upAxis ?? 'Y',
+    arcLengthUniform: opts.arcLengthUniform ?? true,
+    ...(opts.speedCurve && { speedCurve: opts.speedCurve }),
+    ...(opts.lookAtTarget && { lookAtTarget: opts.lookAtTarget }),
+    ...(opts.tiltCurve && { tiltCurve: opts.tiltCurve }),
+  }
 }

@@ -1,6 +1,6 @@
 {
   "name": "dollycurve",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Blender-style F-Curve / camera path editor for Three.js — bezier handles, easings, cycles modifier, canvas graph editor + timeline. Web port of Blender's animation engine.",
   "type": "module",
   "license": "MIT",

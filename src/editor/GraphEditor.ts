@@ -9,8 +9,14 @@ import { deleteKeyframe } from '../editing/delete'
 import { recalcAllHandles } from '../editing/handles'
 import { moveKeyframeTimeWithHandles, moveKeyframeValueWithHandles } from '../editing/move'
 import { sortFCurve } from '../editing/sort'
-import { channelLabel, formatValue, isAngleRnaPath, rnaPathSortKey } from './labels'
-import { showSimpleMenu, type MenuItem } from './Timeline'
+import { channelGroup, channelGroupSortKey, channelLabel, formatValue, isAngleRnaPath, rnaPathSortKey } from './labels'
+import { showSimpleMenu, type MenuItem } from './menu'
+import { niceStep } from './draw-utils'
+import {
+  THEME, STYLE, STYLE_ID,
+  HIT_RADIUS, VERT_SIZE, HANDLE_DOT_SIZE, Y_PAD_FRAC, X_PAD_FRAC,
+  colorForFCurve,
+} from './graph-theme'
 
 type HitPart = 'anchor' | 'h1' | 'h2'
 
@@ -40,96 +46,16 @@ export interface GraphEditorOptions {
   getCurrentFrame: () => number
   setCurrentFrame?: (frame: number) => void
   onChanged?: () => void
+  /** Fired once per user-intent COMMAND boundary (drag commit, delete, set
+   * ipo / handle / snap). Use this to push undo steps — `onChanged` fires
+   * per pointermove during a drag, which is too granular for undo. The
+   * `label` is a short human-readable description for history menus. */
+  onCommit?: (label: string) => void
   viewX?: SharedXView
   onViewXChanged?: () => void
   getFrameRange?: () => [number, number] | null
 }
 
-// Mirrors Blender's FCURVE_COLOR_AUTO_RGB / YRGB rule:
-// vec3 axis 0/1/2 → R/G/B; quaternion 1/2/3 → R/G/B and 0 (W) → grey.
-function colorForFCurve (fcu: FCurve): string {
-  const i = fcu.arrayIndex
-  if (fcu.rnaPath === 'rotation_quaternion') {
-    if (i === 0) return '#cccccc'         // W
-    return ['#e25555', '#5dd35a', '#5da3e2'][i - 1] ?? '#bbbbbb'
-  }
-  if (fcu.rnaPath === 'location' || fcu.rnaPath === 'rotation_euler' || fcu.rnaPath === 'scale') {
-    return ['#e25555', '#5dd35a', '#5da3e2'][i] ?? '#bbbbbb'
-  }
-  switch (fcu.rnaPath) {
-    case 'lens':          return '#f0c040'
-    case 'sensor_height': return '#a080ff'
-    case 'clip_start':    return '#80c0ff'
-    case 'clip_end':      return '#80c0ff'
-    default:              return '#cccccc'
-  }
-}
-
-const THEME = {
-  bg:         '#1f1f23',
-  gridMajor:  '#3a3a44',
-  gridMinor:  '#2a2a32',
-  axisLabel:  '#888',
-  playhead:   '#4a90ff',
-  selBox:     'rgba(74,144,255,0.18)',
-  selBoxLine: '#4a90ff',
-  vertFill:   '#dddddd',
-  vertSel:    '#ffe060',
-  vertActive: '#ffffff',
-  handleLine: 'rgba(255,255,255,0.35)',
-  outOfRange: 'rgba(0,0,0,0.35)',
-  rangeBound: 'rgba(74,144,255,0.30)',
-  handleColors: {
-    [HandleType.FREE]:         '#e25555',
-    [HandleType.AUTO]:         '#e0c040',
-    [HandleType.VECTOR]:       '#5da3e2',
-    [HandleType.ALIGN]:        '#c879ff',
-    [HandleType.AUTO_CLAMPED]: '#e08040',
-  } as Record<HandleType, string>,
-}
-
-const HIT_RADIUS = 10              // px hit threshold (Blender: GVERTSEL_TOL)
-const VERT_SIZE = 5                // half-side of keyframe square
-const HANDLE_DOT_SIZE = 3.5        // radius
-const Y_PAD_FRAC = 0.15            // 15% Y padding on frame-all
-const X_PAD_FRAC = 0.05            // 5% X padding on frame-all
-
-const STYLE_ID = 'ckp-graph-editor-style'
-const STYLE = `
-.ckp-graph { display: flex; height: 100%; width: 100%; font-size: 12px; color: #ddd; user-select: none; }
-.ckp-graph-channels {
-  width: 180px; min-width: 120px; max-width: 240px;
-  border-right: 1px solid #333; overflow-y: auto;
-  background: rgba(28,28,32,0.6);
-}
-.ckp-graph-channel {
-  display: flex; align-items: center; gap: 4px;
-  padding: 4px 4px 4px 6px; cursor: pointer;
-  border-bottom: 1px solid #2a2a2a;
-}
-.ckp-graph-channel:hover { background: #292930; }
-.ckp-graph-channel.active { background: #2a3845; }
-.ckp-graph-channel-eye {
-  width: 18px; text-align: center; color: #666; flex-shrink: 0;
-  font-size: 12px; cursor: pointer; user-select: none;
-}
-.ckp-graph-channel-eye.visible { color: #ddd; }
-.ckp-graph-channel-eye:hover { color: #fff; }
-.ckp-graph-channel-swatch {
-  width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0;
-}
-.ckp-graph-channel-name { flex: 1; font-family: ui-monospace, monospace; font-size: 11px; }
-.ckp-graph-channel-count { color: #777; font-size: 10px; }
-.ckp-graph-canvas-wrap {
-  flex: 1; position: relative; background: ${THEME.bg};
-  outline: none;
-}
-.ckp-graph-canvas { display: block; width: 100%; height: 100%; cursor: default; }
-.ckp-graph-empty {
-  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-  color: #666; pointer-events: none; font-size: 13px;
-}
-`
 
 export class GraphEditor {
   private root: HTMLDivElement
@@ -143,6 +69,7 @@ export class GraphEditor {
   private getCurrentFrame: () => number
   private setCurrentFrame: ((f: number) => void) | null
   private onChanged: () => void
+  private onCommit: (label: string) => void
   private sharedX: SharedXView | null
   private onViewXChanged: () => void
   private getFrameRange: (() => [number, number] | null) | null
@@ -155,6 +82,10 @@ export class GraphEditor {
   // Selection: keys "keyIdx:part" within active fcurve.
   private selected = new Set<string>()
   private activeKey: string | null = null
+  private collapsedGroups = new Set<string>()
+  // Frames where Shift+K marked a column; visible-channel keys at these
+  // frames render with a tinted highlight. Cleared on selection change.
+  private columnFrames: number[] = []
   private dragging: DragState | null = null
   private mouseInCanvas = false
   private rafPending = false
@@ -171,6 +102,7 @@ export class GraphEditor {
     this.getCurrentFrame = opts.getCurrentFrame
     this.setCurrentFrame = opts.setCurrentFrame ?? null
     this.onChanged = opts.onChanged ?? (() => {})
+    this.onCommit = opts.onCommit ?? (() => {})
     this.sharedX = opts.viewX ?? null
     this.onViewXChanged = opts.onViewXChanged ?? (() => {})
     this.getFrameRange = opts.getFrameRange ?? null
@@ -261,6 +193,9 @@ export class GraphEditor {
     const sorted = [...this.action.fcurves]
       .map((f, i) => ({ fcu: f, originalIdx: i }))
       .sort((a, b) => {
+        const ga = channelGroupSortKey(channelGroup(a.fcu.rnaPath))
+        const gb = channelGroupSortKey(channelGroup(b.fcu.rnaPath))
+        if (ga !== gb) return ga - gb
         const ka = rnaPathSortKey(a.fcu.rnaPath)
         const kb = rnaPathSortKey(b.fcu.rnaPath)
         if (ka !== kb) return ka - kb
@@ -289,10 +224,40 @@ export class GraphEditor {
     }
     this.visibleSet.add(this.activeFCurveIdx)
 
+    let lastGroup: string | null = null
     for (const { fcu, originalIdx } of sorted) {
+      const group = channelGroup(fcu.rnaPath)
+      if (group !== lastGroup) {
+        const collapsed = this.collapsedGroups.has(group)
+        const memberCount = sorted.filter((s) => channelGroup(s.fcu.rnaPath) === group).length
+        const header = document.createElement('div')
+        header.className = 'ckp-graph-group'
+        const arrow = document.createElement('span')
+        arrow.className = 'ckp-graph-group-arrow'
+        arrow.textContent = collapsed ? '▸' : '▾'
+        header.appendChild(arrow)
+        const label = document.createElement('span')
+        label.textContent = group
+        header.appendChild(label)
+        const count = document.createElement('span')
+        count.className = 'ckp-graph-group-count'
+        count.textContent = `(${memberCount})`
+        header.appendChild(count)
+        header.addEventListener('click', () => {
+          if (this.collapsedGroups.has(group)) this.collapsedGroups.delete(group)
+          else this.collapsedGroups.add(group)
+          this.refresh()
+        })
+        this.channelsEl.appendChild(header)
+        lastGroup = group
+      }
+      if (this.collapsedGroups.has(group)) continue
+
       const row = document.createElement('div')
-      row.className = 'ckp-graph-channel'
+      row.className = 'ckp-graph-channel in-group'
       if (originalIdx === this.activeFCurveIdx) row.classList.add('active')
+      if (fcu.muted) row.classList.add('is-muted')
+      if (fcu.locked) row.classList.add('is-locked')
 
       const eye = document.createElement('span')
       const isVisible = this.visibleSet.has(originalIdx) || originalIdx === this.activeFCurveIdx
@@ -301,12 +266,36 @@ export class GraphEditor {
       eye.title = isVisible ? 'Hide channel' : 'Show channel'
       eye.addEventListener('click', (e) => {
         e.stopPropagation()
-        if (originalIdx === this.activeFCurveIdx) return  // active stays visible
+        if (originalIdx === this.activeFCurveIdx) return
         if (this.visibleSet.has(originalIdx)) this.visibleSet.delete(originalIdx)
         else this.visibleSet.add(originalIdx)
         this.refresh()
       })
       row.appendChild(eye)
+
+      const mute = document.createElement('span')
+      mute.className = 'ckp-graph-channel-mute' + (fcu.muted ? ' muted' : '')
+      mute.textContent = fcu.muted ? 'M' : 'm'
+      mute.title = fcu.muted ? 'Unmute (curve evaluates again)' : 'Mute (skip evaluation; output 0)'
+      mute.addEventListener('click', (e) => {
+        e.stopPropagation()
+        fcu.muted = !fcu.muted
+        this.onChanged()
+        this.refresh()
+      })
+      row.appendChild(mute)
+
+      const lock = document.createElement('span')
+      lock.className = 'ckp-graph-channel-lock' + (fcu.locked ? ' locked' : '')
+      lock.textContent = fcu.locked ? 'L' : 'l'
+      lock.title = fcu.locked ? 'Unlock (allow edits)' : 'Lock (prevent drag/insert/delete)'
+      lock.addEventListener('click', (e) => {
+        e.stopPropagation()
+        fcu.locked = !fcu.locked
+        this.onChanged()
+        this.refresh()
+      })
+      row.appendChild(lock)
 
       const swatch = document.createElement('div')
       swatch.className = 'ckp-graph-channel-swatch'
@@ -397,6 +386,37 @@ export class GraphEditor {
     this.requestRender()
   }
 
+  /** Full view rectangle (frame, value). Useful for persistence. */
+  getView (): { xMin: number; xMax: number; yMin: number; yMax: number } {
+    return { ...this.view }
+  }
+
+  /** Apply a previously-captured view. Skips fields not provided. */
+  setView (v: Partial<{ xMin: number; xMax: number; yMin: number; yMax: number }>): void {
+    if (v.xMin !== undefined) this.view.xMin = v.xMin
+    if (v.xMax !== undefined) this.view.xMax = v.xMax
+    if (v.yMin !== undefined) this.view.yMin = v.yMin
+    if (v.yMax !== undefined) this.view.yMax = v.yMax
+    if (this.sharedX) {
+      this.sharedX.xMin = this.view.xMin
+      this.sharedX.xMax = this.view.xMax
+    }
+    this.requestRender()
+  }
+
+  getActiveFCurveIdx (): number { return this.activeFCurveIdx }
+  setActiveFCurveIdx (idx: number): void {
+    if (idx === this.activeFCurveIdx) return
+    this.activeFCurveIdx = idx
+    this.refresh()
+  }
+
+  getCollapsedGroups (): string[] { return [...this.collapsedGroups] }
+  setCollapsedGroups (groups: readonly string[]): void {
+    this.collapsedGroups = new Set(groups)
+    this.refresh()
+  }
+
   private render (): void {
     if (this.canvas.width === 0) this.onResize()
     this.syncFromShared()
@@ -406,6 +426,7 @@ export class GraphEditor {
 
     this.drawGrid()
     this.drawOutOfRangeShading()
+    this.drawColumnHighlight()
 
     // Non-active visible channels first, low opacity, behind active.
     // Drawn in the SAME Y space as the active channel so zoom scales
@@ -821,6 +842,7 @@ export class GraphEditor {
     this.wrapEl.focus()
     const [mx, my] = this.localCoord(e)
     this.lastMouse = [mx, my]
+    this.columnFrames = []
 
     if (e.button === 1 || (e.button === 0 && e.altKey)) {
       this.dragging = { kind: 'pan', startX: mx, startY: my }
@@ -863,6 +885,7 @@ export class GraphEditor {
   private beginTranslate (mx: number, my: number): void {
     const fcu = this.activeFCurve()
     if (!fcu) return
+    if (fcu.locked) return  // FCURVE_PROTECTED — refuse drag
 
     // Promote AUTO/AUTO_CLAMPED handles to ALIGN at drag-start so user-
     // set positions survive the next handle recalc. Mirrors Blender's
@@ -1015,11 +1038,15 @@ export class GraphEditor {
       this.dragging = null
       return
     }
+    const wasTranslate = this.dragging.kind === 'translate'
     if (this.dragging.kind === 'box') {
       this.commitBoxSelection(e.shiftKey)
     }
     this.dragging = null
     this.requestRender()
+    // One undo step per drag commit, not per pointermove. Box-select doesn't
+    // mutate data and isn't part of undo (Blender's choice; we agree).
+    if (wasTranslate) this.onCommit('move keyframe')
   }
 
   private commitBoxSelection (additive: boolean): void {
@@ -1086,7 +1113,39 @@ export class GraphEditor {
     } else if (e.key === 't' || e.key === 'T') {
       this.cycleInterpolation()
       e.preventDefault()
+    } else if ((e.key === 'k' || e.key === 'K') && e.shiftKey) {
+      this.markColumn()
+      e.preventDefault()
     }
+  }
+
+  private drawColumnHighlight (): void {
+    if (this.columnFrames.length === 0) return
+    const ctx = this.ctx
+    ctx.fillStyle = 'rgba(255, 224, 96, 0.10)'  // gold tint
+    for (const f of this.columnFrames) {
+      const x = this.xToPx(f)
+      ctx.fillRect(x - 1.5, 0, 3, this.cssHeight)
+    }
+  }
+
+  /** Shift+K: collect frames of currently-selected anchors and render keys
+   * at those frames in OTHER visible channels with a column highlight.
+   * (graph.select_column in Blender — we draw the tint but don't yet support
+   * multi-fcurve drag, so the highlight is informational, not a selection.) */
+  private markColumn (): void {
+    const fcu = this.activeFCurve()
+    if (!fcu) return
+    const frames = new Set<number>()
+    for (const key of this.selected) {
+      const [idxStr, part] = key.split(':')
+      if (part !== 'anchor') continue
+      const i = parseInt(idxStr)
+      const b = fcu.bezt[i]
+      if (b) frames.add(b.vec[1][0])
+    }
+    this.columnFrames = [...frames]
+    this.requestRender()
   }
 
   private onContextMenu (e: MouseEvent): void {
@@ -1115,23 +1174,35 @@ export class GraphEditor {
       return
     }
 
+    // Common ipo / handle across the selection — used to mark the active
+    // option in submenus. Returns null on a mixed selection so no item is
+    // checked (matches Blender's "—" indicator on mixed properties).
+    const commonIpo = this.commonIpoOfSelection()
+    const commonHandle = this.commonHandleOfSelection()
+    const ipoItem = (label: string, ipo: Interpolation): MenuItem => ({
+      label, checked: commonIpo === ipo, action: () => this.setSelectedIpo(ipo),
+    })
+    const handleItem = (label: string, h: HandleType): MenuItem => ({
+      label, checked: commonHandle === h, action: () => this.setSelectedHandle(h),
+    })
+
     const items: MenuItem[] = [
       { label: 'Interpolation' },
-      { label: 'Constant',  action: () => this.setSelectedIpo(Interpolation.CONSTANT) },
-      { label: 'Linear',    action: () => this.setSelectedIpo(Interpolation.LINEAR) },
-      { label: 'Bezier',    action: () => this.setSelectedIpo(Interpolation.BEZIER) },
-      { label: 'Sine',      action: () => this.setSelectedIpo(Interpolation.SINE) },
-      { label: 'Cubic',     action: () => this.setSelectedIpo(Interpolation.CUBIC) },
-      { label: 'Back',      action: () => this.setSelectedIpo(Interpolation.BACK) },
-      { label: 'Bounce',    action: () => this.setSelectedIpo(Interpolation.BOUNCE) },
-      { label: 'Elastic',   action: () => this.setSelectedIpo(Interpolation.ELASTIC) },
+      ipoItem('Constant',  Interpolation.CONSTANT),
+      ipoItem('Linear',    Interpolation.LINEAR),
+      ipoItem('Bezier',    Interpolation.BEZIER),
+      ipoItem('Sine',      Interpolation.SINE),
+      ipoItem('Cubic',     Interpolation.CUBIC),
+      ipoItem('Back',      Interpolation.BACK),
+      ipoItem('Bounce',    Interpolation.BOUNCE),
+      ipoItem('Elastic',   Interpolation.ELASTIC),
       { separator: true },
       { label: 'Handle Type' },
-      { label: 'Auto Clamped', action: () => this.setSelectedHandle(HandleType.AUTO_CLAMPED) },
-      { label: 'Auto',         action: () => this.setSelectedHandle(HandleType.AUTO) },
-      { label: 'Vector',       action: () => this.setSelectedHandle(HandleType.VECTOR) },
-      { label: 'Align',        action: () => this.setSelectedHandle(HandleType.ALIGN) },
-      { label: 'Free',         action: () => this.setSelectedHandle(HandleType.FREE) },
+      handleItem('Auto Clamped', HandleType.AUTO_CLAMPED),
+      handleItem('Auto',         HandleType.AUTO),
+      handleItem('Vector',       HandleType.VECTOR),
+      handleItem('Align',        HandleType.ALIGN),
+      handleItem('Free',         HandleType.FREE),
       { separator: true },
       { label: 'Snap selection to current frame', action: () => this.snapSelectedToCurrentFrame() },
       { label: 'Frame selected (Shift+F)', action: () => { this.frameSelected(); this.requestRender() } },
@@ -1139,6 +1210,37 @@ export class GraphEditor {
       { label: 'Delete (X)', action: () => this.deleteSelectedAnchors() },
     ]
     showSimpleMenu(e.clientX, e.clientY, items)
+  }
+
+  private commonIpoOfSelection (): Interpolation | null {
+    const fcu = this.activeFCurve()
+    if (!fcu) return null
+    let common: Interpolation | null = null
+    for (const key of this.selected) {
+      const [idxStr, part] = key.split(':')
+      if (part !== 'anchor') continue
+      const b = fcu.bezt[parseInt(idxStr)]
+      if (!b) continue
+      if (common === null) common = b.ipo
+      else if (common !== b.ipo) return null  // mixed
+    }
+    return common
+  }
+
+  private commonHandleOfSelection (): HandleType | null {
+    const fcu = this.activeFCurve()
+    if (!fcu) return null
+    let common: HandleType | null = null
+    for (const key of this.selected) {
+      const [idxStr, part] = key.split(':')
+      if (part !== 'anchor') continue
+      const b = fcu.bezt[parseInt(idxStr)]
+      if (!b) continue
+      if (b.h1 !== b.h2) return null  // asymmetric
+      if (common === null) common = b.h1
+      else if (common !== b.h1) return null  // mixed
+    }
+    return common
   }
 
   private setSelectedIpo (ipo: Interpolation): void {
@@ -1153,6 +1255,7 @@ export class GraphEditor {
     }
     this.onChanged()
     this.requestRender()
+    this.onCommit('set interpolation')
   }
 
   private setSelectedHandle (h: HandleType): void {
@@ -1168,6 +1271,7 @@ export class GraphEditor {
     recalcAllHandles(fcu)
     this.onChanged()
     this.requestRender()
+    this.onCommit('set handle type')
   }
 
   private snapSelectedToCurrentFrame (): void {
@@ -1202,6 +1306,7 @@ export class GraphEditor {
     }
     this.onChanged()
     this.requestRender()
+    this.onCommit('snap to frame')
   }
 
   private onDblClick (e: MouseEvent): void {
@@ -1214,7 +1319,7 @@ export class GraphEditor {
 
   private deleteSelectedAnchors (): void {
     const fcu = this.activeFCurve()
-    if (!fcu) return
+    if (!fcu || fcu.locked) return
     const idxs: number[] = []
     for (const key of this.selected) {
       const [idxStr, part] = key.split(':')
@@ -1227,11 +1332,12 @@ export class GraphEditor {
     this.activeKey = null
     this.onChanged()
     this.requestRender()
+    if (idxs.length > 0) this.onCommit('delete keys')
   }
 
   private cycleHandleType (): void {
     const fcu = this.activeFCurve()
-    if (!fcu) return
+    if (!fcu || fcu.locked) return
     const order = [HandleType.AUTO_CLAMPED, HandleType.AUTO, HandleType.VECTOR, HandleType.ALIGN, HandleType.FREE]
     for (const key of this.selected) {
       const [idxStr, part] = key.split(':')
@@ -1247,11 +1353,12 @@ export class GraphEditor {
     recalcAllHandles(fcu)
     this.onChanged()
     this.requestRender()
+    this.onCommit('cycle handle type')
   }
 
   private cycleInterpolation (): void {
     const fcu = this.activeFCurve()
-    if (!fcu) return
+    if (!fcu || fcu.locked) return
     const order: Interpolation[] = [
       Interpolation.BEZIER, Interpolation.LINEAR, Interpolation.CONSTANT,
       Interpolation.SINE, Interpolation.QUAD, Interpolation.CUBIC, Interpolation.BACK, Interpolation.BOUNCE, Interpolation.ELASTIC,
@@ -1268,6 +1375,7 @@ export class GraphEditor {
     }
     this.onChanged()
     this.requestRender()
+    this.onCommit('cycle interpolation')
   }
 
   private frameSelected (): void {
@@ -1328,16 +1436,4 @@ export class GraphEditor {
   }
 }
 
-// "Nice" round step (1, 2, 5, 10, ...) for grid labels.
-function niceStep (raw: number): number {
-  if (raw <= 0) return 1
-  const exp = Math.floor(Math.log10(raw))
-  const f = raw / Math.pow(10, exp)
-  let nice: number
-  if (f < 1.5) nice = 1
-  else if (f < 3) nice = 2
-  else if (f < 7) nice = 5
-  else nice = 10
-  return nice * Math.pow(10, exp)
-}
 

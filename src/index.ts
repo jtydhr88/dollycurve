@@ -15,7 +15,9 @@ export {
   recalcHandlesAround,
   recalcAllHandles,
 } from './editing/handles'
-export { unwrapEulerFCurve, unwrapEulerInAction } from './editing/unwrap-euler'
+export { unwrapEulerFCurve, unwrapEulerInAction, alignQuaternionHemisphere } from './editing/unwrap-euler'
+export { UndoStack } from './undo/UndoStack'
+export type { UndoStackOptions } from './undo/UndoStack'
 export {
   insertOrReplaceKeyframe,
   insertVec3Key,
@@ -30,10 +32,21 @@ export { sortFCurve } from './editing/sort'
 export { deleteKeyframe, deleteKeyframesAtFrames } from './editing/delete'
 export { bakeFCurve } from './editing/bake'
 export type { BakeOptions } from './editing/bake'
+export { bakePathToFCurves } from './editing/bake-path'
+export type { BakePathOptions } from './editing/bake-path'
+export { fitFCurvesToPath } from './editing/fit-path'
+export type { FitPathOptions } from './editing/fit-path'
 export { cleanFCurve } from './editing/clean'
 export { decimateFCurve } from './editing/decimate'
 export type { DecimateOptions } from './editing/decimate'
 export { CameraTrackBinding } from './three/CameraTrackBinding'
+export { ScenePathEditor } from './editor/ScenePathEditor'
+export type { ScenePathEditorOptions, PathHit, HitKind } from './editor/ScenePathEditor'
+export { bezierSegmentPos, bezierSegmentTan, pathPos, pathTangent, segmentCount } from './spline/bezier3d'
+export { buildArcTable, arcLengthToU, uToArcLength } from './spline/arc-length'
+export type { ArcTable } from './spline/arc-length'
+export { buildFrames, frameAtU, frameToQuaternion } from './spline/orientation'
+export type { OrientationFrame } from './spline/orientation'
 export {
   exportCameraActionToJson,
   importCameraActionFromJson,
@@ -44,7 +57,11 @@ export type {
   FCurveJson,
   ModifierJson,
   CyclesModifierJson,
+  NoiseModifierJson,
   BezTripleJson,
+  PathFollowConstraintJson,
+  SplinePathJson,
+  SplinePointJson,
 } from './io/blender-json'
 export { SimplePanel } from './editor/SimplePanel'
 export type { SimplePanelOptions } from './editor/SimplePanel'

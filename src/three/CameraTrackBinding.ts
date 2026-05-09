@@ -1,6 +1,9 @@
 import { Euler, MathUtils, PerspectiveCamera, Quaternion, Vector3 } from 'three'
-import { CameraAction } from '../data/types'
+import { CameraAction, PathFollowConstraint } from '../data/types'
 import { evaluateFCurve } from '../eval/evaluate'
+import { pathPos, segmentCount } from '../spline/bezier3d'
+import { arcLengthToU, buildArcTable, type ArcTable } from '../spline/arc-length'
+import { frameAtU, frameToQuaternion } from '../spline/orientation'
 
 export interface CameraBindingOptions {
   /** Vertical sensor in mm (default 24, Blender's default). Used for lens→fov. */
@@ -28,6 +31,8 @@ export class CameraTrackBinding {
   private tmpEuler = new Euler()
   private tmpPos = new Vector3()
   private tmpQuat = new Quaternion()
+  private cachedPath: PathFollowConstraint['splinePath'] | null = null
+  private cachedArcTable: ArcTable | null = null
 
   constructor (
     public camera: PerspectiveCamera,
@@ -36,6 +41,14 @@ export class CameraTrackBinding {
   ) {
     this.sensorHeight = opts.sensorHeight ?? 24
     this.eulerOrder = opts.eulerOrder ?? 'XYZ'
+  }
+
+  private getArcTable (path: PathFollowConstraint['splinePath']): ArcTable {
+    if (this.cachedPath !== path) {
+      this.cachedPath = path
+      this.cachedArcTable = buildArcTable(path)
+    }
+    return this.cachedArcTable!
   }
 
   evaluate (timeInSeconds: number): void {
@@ -47,14 +60,24 @@ export class CameraTrackBinding {
       ;(byPath[fcu.rnaPath] ??= [])[fcu.arrayIndex] = v
     }
 
-    if (byPath.location) {
+    // Path-follow takes precedence over location FCurves: the spline drives
+    // position, and (depending on `orientation`) drives rotation too. FCurves
+    // for lens/clip/sensor still apply.
+    const pf = this.action.pathFollow
+    let pathDroveRotation = false
+    if (pf) {
+      this.applyPathFollow(pf, frame)
+      pathDroveRotation = pf.orientation !== 'free'
+    } else if (byPath.location) {
       this.tmpPos.fromArray(byPath.location)
       this.camera.position.copy(this.tmpPos)
     }
 
     // Quaternion takes precedence over Euler — required for any preset
     // crossing gimbal lock or rotating past ±180°.
-    if (byPath.rotation_quaternion) {
+    if (pathDroveRotation) {
+      // Path already wrote rotation; skip FCurve rotation.
+    } else if (byPath.rotation_quaternion) {
       const q = byPath.rotation_quaternion
       this.tmpQuat.set(q[0] ?? 0, q[1] ?? 0, q[2] ?? 0, q[3] ?? 1)
       // Component-wise lerp between keys is close to slerp for small steps,
@@ -106,6 +129,52 @@ export class CameraTrackBinding {
         }
       }
     }
+  }
+
+  private applyPathFollow (pf: PathFollowConstraint, frame: number): void {
+    const path = pf.splinePath
+    const segs = segmentCount(path)
+    if (segs === 0) return
+
+    // 1) frame → arc-length s (or raw param u, depending on arcLengthUniform).
+    const table = this.getArcTable(path)
+    const total = pf.arcLengthUniform ? table.totalLen : segs
+    let s: number
+    if (pf.speedCurve) {
+      s = evaluateFCurve(pf.speedCurve, frame)
+    } else {
+      // Default: traverse full path linearly over the action's frame range.
+      // Without an explicit duration we fall back to "frame == s" so authors
+      // can drive it with a synthetic location FCurve if needed.
+      s = frame
+    }
+    s = Math.max(0, Math.min(total, s))
+    const u = pf.arcLengthUniform ? arcLengthToU(table, s) : s
+
+    // 2) Position
+    const pos = pathPos(path, u)
+    this.camera.position.set(pos[0], pos[1], pos[2])
+
+    // 3) Orientation
+    if (pf.orientation === 'tangent') {
+      const tilt = pf.tiltCurve ? evaluateFCurve(pf.tiltCurve, frame) : 0
+      const f = frameAtU(path, pf.upAxis, u)
+      const q = frameToQuaternion(f, tilt)
+      this.camera.quaternion.set(q[0], q[1], q[2], q[3])
+    } else if (pf.orientation === 'lookAt' && pf.lookAtTarget) {
+      this.camera.lookAt(pf.lookAtTarget[0], pf.lookAtTarget[1], pf.lookAtTarget[2])
+      // Apply tilt as a roll around the camera's current forward.
+      if (pf.tiltCurve) {
+        const tilt = evaluateFCurve(pf.tiltCurve, frame)
+        if (tilt !== 0) {
+          const fwd = new Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion)
+          this.tmpQuat.setFromAxisAngle(fwd, tilt)
+          this.camera.quaternion.premultiply(this.tmpQuat)
+        }
+      }
+    }
+    // orientation === 'free': caller's rotation FCurves drive it (handled
+    // by the existing FCurve dispatch below).
   }
 
   /** Reverse-derive: return FCurve values that would reproduce camera's current state. */
