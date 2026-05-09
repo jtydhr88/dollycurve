@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>dollycurve — Blender-style camera keyframe editor</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #1a1a1a; color: #ddd; font-family: system-ui, sans-serif; overflow: hidden; }
+
+      /* Blender-style tiled layout: editor regions occupy real grid cells,
+         no floating overlays. Bottom strip and side panel push the 3D
+         viewport's available space, and the renderer auto-fits via a
+         ResizeObserver on #canvas-host. */
+      #layout {
+        display: grid;
+        grid-template-columns: 1fr 340px;
+        grid-template-rows: 1fr auto;
+        grid-template-areas:
+          "viewport sidebar"
+          "bottom   sidebar";
+        height: 100vh;
+        gap: 1px;
+        background: #0e0e10;  /* shows through as 1px borders between editors */
+      }
+      #canvas-host {
+        grid-area: viewport;
+        position: relative; overflow: hidden;
+        background: #1a1a1a;
+      }
+      #canvas-host canvas { display: block; width: 100%; height: 100%; }
+
+      #panel {
+        grid-area: sidebar;
+        display: flex; flex-direction: column;
+        background: #232328;
+        padding: 10px; font-size: 13px;
+      }
+      #panel h2 { margin: 0 0 8px; font-size: 14px; color: #fff; font-weight: 600; }
+      #panel .row { display: flex; gap: 6px; align-items: center; margin: 6px 0; }
+      #panel button {
+        background: #2c2c33; color: #ddd; border: 1px solid #3a3a42; border-radius: 3px;
+        padding: 4px 10px; font-size: 12px; cursor: pointer;
+      }
+      #panel button:hover { background: #353540; }
+      #panel button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+      #panel button.primary:hover { background: #1d4fd8; }
+      #panel h2 { margin: 0 0 8px; font-size: 12px; color: #999; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
+      #panel input[type="number"] { width: 60px; background: #1f1f23; color: #ddd; border: 1px solid #333; border-radius: 4px; padding: 3px 6px; }
+      #panel label { font-size: 12px; color: #aaa; }
+
+      #keyframes { flex: 1; overflow-y: auto; margin-top: 8px; padding-top: 4px; }
+
+      #bottom { grid-area: bottom; display: flex; flex-direction: column; min-height: 0; }
+      #scrubber-bar {
+        background: #232328;
+        padding: 6px 10px; display: flex; gap: 8px; align-items: center; font-size: 12px;
+      }
+      #scrubber-bar button {
+        background: #2c2c33; color: #ddd; border: 1px solid #3a3a42; border-radius: 3px;
+        padding: 3px 8px; font-size: 12px; cursor: pointer;
+        min-width: 26px;
+      }
+      #scrubber-bar button:hover { background: #353540; }
+      #scrubber-bar button.active { background: #2a3845; border-color: #3a4855; color: #fff; }
+      #scrubber-bar button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+      #scrubber-bar button.primary:hover { background: #1d4fd8; }
+      #scrubber-bar .ckp-divider { width: 1px; height: 18px; background: #3a3a42; margin: 0 2px; }
+      #scrubber-bar #time-readout { font-family: ui-monospace, monospace; color: #6cf; font-size: 11px; padding: 0 6px; }
+      #scrubber-bar .ckp-inline-label {
+        font-size: 11px; color: #aaa;
+        display: inline-flex; align-items: center; gap: 4px;
+        cursor: pointer; user-select: none;
+      }
+      #scrubber-bar #end-frame {
+        background: #1f1f23; color: #ddd; border: 1px solid #333; border-radius: 3px;
+        padding: 2px 4px; font: 11px ui-monospace, monospace; width: 50px;
+      }
+
+      /* Timeline strip — always visible, immediately above the graph
+         canvas so they share an X column. */
+      #timeline-bar {
+        background: #232328; height: 44px;
+        border-bottom: 1px solid #1a1a1a;
+        transition: padding-left 0.15s ease-out;
+      }
+      #timeline-host { width: 100%; height: 100%; }
+      /* When the graph editor is open, indent the timeline so its X axis
+         lines up with the curve canvas (the graph editor reserves 180px
+         on the left for the channel list). */
+      #bottom.with-graph #timeline-bar { padding-left: 180px; }
+
+      #graph-bottom {
+        height: 320px; background: #1f1f23;
+        overflow: hidden; display: flex; flex-direction: column;
+        border-bottom: 1px solid #0e0e10;
+      }
+      #graph-bottom.hidden { display: none; }
+      #graph-host { flex: 1; min-height: 0; }
+      #help {
+        position: absolute; left: 8px; top: 8px;
+        font-size: 11px; color: #888; line-height: 1.5;
+        background: rgba(20,20,24,0.6); padding: 6px 8px; border-radius: 3px;
+        pointer-events: none;
+      }
+      #help b { color: #ddd; }
+    </style>
+</head>
+<body>
+    <div id="layout">
+      <div id="canvas-host">
+        <div id="help">
+          <b>Camera Keyframe POC</b><br/>
+          Drag = orbit · Right-drag = pan · Scroll = zoom · K = keyframe @ T
+        </div>
+      </div>
+      <div id="panel">
+      <h2>Camera Keyframes</h2>
+      <div class="row">
+        <button id="load-json">Load JSON…</button>
+        <button id="save-json">Save JSON</button>
+        <input id="load-json-input" type="file" accept=".json,application/json" style="display:none" />
+        <button id="clear-kf">Clear all</button>
+      </div>
+      <div id="keyframes"></div>
+    </div>
+
+      <div id="bottom">
+        <div id="timeline-bar">
+          <div id="timeline-host"></div>
+        </div>
+
+        <div id="graph-bottom" class="hidden">
+          <div id="graph-host"></div>
+        </div>
+
+        <div id="scrubber-bar">
+          <button id="toggle-graph" title="Show / hide graph editor">📈</button>
+          <span style="flex:1"></span>
+          <button id="reset-time" title="Jump to start (T = 0)">⏮</button>
+          <button id="prev-key" title="Jump to previous keyframe (Down)">⏪</button>
+          <button id="play" title="Play / Pause">▶</button>
+          <button id="next-key" title="Jump to next keyframe (Up)">⏩</button>
+          <div class="ckp-divider"></div>
+          <button id="add-kf" class="primary" title="Capture all from camera at current time (K)">+ Keyframe</button>
+          <span style="flex:1"></span>
+          <label class="ckp-inline-label">End</label>
+          <input id="end-frame" type="number" min="1" max="10000" step="1" value="250" />
+          <div class="ckp-divider"></div>
+          <label class="ckp-inline-label"><input id="preview-toggle" type="checkbox" /> Preview cam</label>
+          <div class="ckp-divider"></div>
+          <span id="time-readout">0 / 250  ·  0.00s</span>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="./main.ts"></script>
+</body>
+</html>
