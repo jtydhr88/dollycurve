@@ -1,11 +1,7 @@
 import {
-  BufferAttribute,
-  BufferGeometry,
   Camera,
   Color,
   Group,
-  Line,
-  LineBasicMaterial,
   Mesh,
   MeshBasicMaterial,
   Object3D,
@@ -16,8 +12,15 @@ import {
   Vector2,
   Vector3,
 } from 'three'
+import { Line2 } from 'three/examples/jsm/lines/Line2.js'
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js'
+import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js'
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js'
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js'
+import { HandleType } from '../data/enums'
 import { SplinePath, SplinePoint, Vec3 as Vec3Tuple } from '../data/types'
 import { pathPos, segmentCount } from '../spline/bezier3d'
+import { applyAlignAfterDrag, h1Type, nextHandleType, recalcAllSplineHandles, recalcSplineHandle } from '../spline/handles'
 
 export type HitKind = 'anchor' | 'h1' | 'h2'
 export interface PathHit {
@@ -31,32 +34,50 @@ export interface ScenePathEditorOptions {
   dom: HTMLElement
   path: SplinePath
   onChanged?: () => void
+  /** Called once per user-intent boundary (drag release, click insert,
+   * V-cycle, dissolve, etc.) so the host can push an undo step. Receives
+   * a short human-readable label. Not called for selection-only changes
+   * (click empty deselect) or zero-movement drags. */
+  onCommit?: (label: string) => void
   /** Samples per segment for the spline polyline. Default 48. */
   resolution?: number
-  /** Anchor handle radius in world units. Default 0.05. */
+  /** Anchor handle radius in world units. Default 0.08. */
   anchorRadius?: number
+  /** Spline curve line width in CSS pixels (Line2). Default 3. */
+  splineLineWidth?: number
+  /** Handle bar line width in CSS pixels (LineSegments2). Default 2. */
+  handleLineWidth?: number
 }
 
-const COLOR_SPLINE         = new Color('#88ccff')
-const COLOR_HANDLE_LINE    = new Color('#666666')
+const COLOR_SPLINE         = new Color('#0066ff')
+const COLOR_HANDLE_LINE    = new Color('#3a3a3a')
 const COLOR_ANCHOR         = new Color('#ffffff')
 const COLOR_ANCHOR_HOVER   = new Color('#ffe060')
 const COLOR_ANCHOR_ACTIVE  = new Color('#ff7733')
-const COLOR_HANDLE_DOT     = new Color('#cccccc')
+const COLOR_HANDLE_DOT     = new Color('#aaaaaa')
+const COLOR_GHOST_INSERT   = new Color('#22c55e')  // semi-transparent "add" affordance
 
 export class ScenePathEditor {
   private scene: Scene
   private camera: Camera
   private dom: HTMLElement
   private onChanged: () => void
+  private onCommit: (label: string) => void
   private resolution: number
   private anchorRadius: number
 
   private root: Group
-  private splineLine: Line
+  private splineLine: Line2
+  private splineMaterial: LineMaterial
+  private handleSegments: LineSegments2
+  private handleSegmentsMaterial: LineMaterial
+  private activeHandleSegments: LineSegments2
+  private activeHandleSegmentsMaterial: LineMaterial
   private anchorMeshes: Mesh[] = []
-  private handleLineMeshes: Line[] = []
   private handleDotMeshes: Mesh[] = []
+  private ghostMesh: Mesh
+  private ghostInsert: { segIdx: number; t: number } | null = null
+  private resizeObserver: ResizeObserver | null = null
 
   private hovered: PathHit | null = null
   private active: PathHit | null = null
@@ -76,6 +97,7 @@ export class ScenePathEditor {
   private boundOnPointerMove = (e: PointerEvent): void => this.onPointerMove(e)
   private boundOnPointerDown = (e: PointerEvent): void => this.onPointerDown(e)
   private boundOnPointerUp = (e: PointerEvent): void => this.onPointerUp(e)
+  private boundOnPointerLeave = (): void => this.setGhost(null)
   private boundOnKeyDown = (e: KeyboardEvent): void => this.onKeyDown(e)
 
   constructor (
@@ -86,24 +108,82 @@ export class ScenePathEditor {
     this.camera = opts.camera
     this.dom = opts.dom
     this.onChanged = opts.onChanged ?? (() => {})
+    this.onCommit = opts.onCommit ?? (() => {})
     this.resolution = opts.resolution ?? 48
-    this.anchorRadius = opts.anchorRadius ?? 0.05
+    this.anchorRadius = opts.anchorRadius ?? 0.08
 
     this.root = new Group()
     this.root.name = 'dollycurve:ScenePathEditor'
     this.scene.add(this.root)
 
-    this.splineLine = this.makeSplineLine()
+    this.splineMaterial = new LineMaterial({
+      color: COLOR_SPLINE,
+      linewidth: opts.splineLineWidth ?? 3,
+      depthTest: false,
+      transparent: true,
+      opacity: 0.95,
+    })
+    this.splineLine = new Line2(new LineGeometry(), this.splineMaterial)
+    this.splineLine.renderOrder = 999
+    this.splineLine.frustumCulled = false
     this.root.add(this.splineLine)
 
-    // Capture phase: run before OrbitControls so a control-point hit can
-    // stopPropagation and prevent the camera from also being dragged.
+    this.handleSegmentsMaterial = new LineMaterial({
+      color: COLOR_HANDLE_LINE,
+      linewidth: opts.handleLineWidth ?? 2,
+      depthTest: false,
+      transparent: true,
+      opacity: 0.25,
+    })
+    this.handleSegments = new LineSegments2(new LineSegmentsGeometry(), this.handleSegmentsMaterial)
+    this.handleSegments.renderOrder = 999
+    this.handleSegments.frustumCulled = false
+    this.root.add(this.handleSegments)
+
+    this.activeHandleSegmentsMaterial = new LineMaterial({
+      color: COLOR_HANDLE_LINE,
+      linewidth: opts.handleLineWidth ?? 2,
+      depthTest: false,
+      transparent: true,
+      opacity: 0.95,
+    })
+    this.activeHandleSegments = new LineSegments2(new LineSegmentsGeometry(), this.activeHandleSegmentsMaterial)
+    // renderOrder 999.5 sits between the faded bars (999) and the dots (1000).
+    this.activeHandleSegments.renderOrder = 999.5
+    this.activeHandleSegments.frustumCulled = false
+    this.activeHandleSegments.visible = false
+    this.root.add(this.activeHandleSegments)
+
+    this.ghostMesh = new Mesh(
+      new SphereGeometry(this.anchorRadius, 12, 8),
+      new MeshBasicMaterial({ color: COLOR_GHOST_INSERT, depthTest: false, transparent: true, opacity: 0.45 }),
+    )
+    this.ghostMesh.renderOrder = 1000
+    this.ghostMesh.visible = false
+    this.root.add(this.ghostMesh)
+
+    this.updateLineResolution()
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => this.updateLineResolution())
+      this.resizeObserver.observe(this.dom)
+    }
+
+    // Capture phase: run before OrbitControls so a hit can stopPropagation.
     this.dom.addEventListener('pointermove', this.boundOnPointerMove, true)
     this.dom.addEventListener('pointerdown', this.boundOnPointerDown, true)
     this.dom.addEventListener('pointerup', this.boundOnPointerUp, true)
     this.dom.addEventListener('pointercancel', this.boundOnPointerUp, true)
+    this.dom.addEventListener('pointerleave', this.boundOnPointerLeave)
 
     this.refresh()
+  }
+
+  private updateLineResolution (): void {
+    const w = this.dom.clientWidth || window.innerWidth
+    const h = this.dom.clientHeight || window.innerHeight
+    this.splineMaterial.resolution.set(w, h)
+    this.handleSegmentsMaterial.resolution.set(w, h)
+    this.activeHandleSegmentsMaterial.resolution.set(w, h)
   }
 
   /** Rebuild all visuals. Call after mutating `path` directly. */
@@ -119,7 +199,10 @@ export class ScenePathEditor {
     this.dom.removeEventListener('pointerdown', this.boundOnPointerDown, true)
     this.dom.removeEventListener('pointerup', this.boundOnPointerUp, true)
     this.dom.removeEventListener('pointercancel', this.boundOnPointerUp, true)
+    this.dom.removeEventListener('pointerleave', this.boundOnPointerLeave)
     window.removeEventListener('keydown', this.boundOnKeyDown)
+    this.resizeObserver?.disconnect()
+    this.resizeObserver = null
     this.scene.remove(this.root)
     this.disposeSubtree(this.root)
   }
@@ -130,18 +213,15 @@ export class ScenePathEditor {
     this.updateColors()
   }
 
-  private makeSplineLine (): Line {
-    const geo = new BufferGeometry()
-    const mat = new LineBasicMaterial({ color: COLOR_SPLINE, depthTest: false, transparent: true, opacity: 0.9 })
-    const line = new Line(geo, mat)
-    line.renderOrder = 999  // draw on top of typical scene content
-    return line
-  }
-
   private updateSplineGeometry (): void {
     const segs = segmentCount(this.path)
+    // Replace the geometry on every refresh — reusing one across setPositions
+    // calls drops the tail segment after insertPoint (stale instanceStart).
+    this.splineLine.geometry.dispose()
+    const geo = new LineGeometry()
     if (segs === 0) {
-      this.splineLine.geometry.setAttribute('position', new BufferAttribute(new Float32Array(0), 3))
+      geo.setPositions([0, 0, 0, 0, 0, 0])
+      this.splineLine.geometry = geo
       return
     }
     const total = segs * this.resolution + 1
@@ -153,9 +233,8 @@ export class ScenePathEditor {
       positions[i * 3 + 1] = p[1]
       positions[i * 3 + 2] = p[2]
     }
-    const geo = this.splineLine.geometry
-    geo.setAttribute('position', new BufferAttribute(positions, 3))
-    geo.computeBoundingSphere()
+    geo.setPositions(positions as unknown as number[])
+    this.splineLine.geometry = geo
   }
 
   private updateAnchorMeshes (): void {
@@ -183,23 +262,9 @@ export class ScenePathEditor {
 
   private updateHandleMeshes (): void {
     const N = this.path.points.length
-    const wantLines = N * 2
     const wantDots = N * 2
-    while (this.handleLineMeshes.length < wantLines) {
-      const geo = new BufferGeometry()
-      const mat = new LineBasicMaterial({ color: COLOR_HANDLE_LINE, depthTest: false, transparent: true, opacity: 0.6 })
-      const line = new Line(geo, mat)
-      line.renderOrder = 999
-      this.root.add(line)
-      this.handleLineMeshes.push(line)
-    }
-    while (this.handleLineMeshes.length > wantLines) {
-      const l = this.handleLineMeshes.pop()!
-      this.root.remove(l)
-      this.disposeSubtree(l)
-    }
     while (this.handleDotMeshes.length < wantDots) {
-      const geo = new SphereGeometry(this.anchorRadius * 0.6, 8, 6)
+      const geo = new SphereGeometry(this.anchorRadius, 12, 8)
       const mat = new MeshBasicMaterial({ color: COLOR_HANDLE_DOT, depthTest: false, transparent: true })
       const mesh = new Mesh(geo, mat)
       mesh.renderOrder = 1000
@@ -213,16 +278,23 @@ export class ScenePathEditor {
       this.root.remove(m)
       this.disposeSubtree(m)
     }
+    const segPositions = new Float32Array(N * 2 * 6)
     for (let i = 0; i < N; i++) {
       const p = this.path.points[i]
-      const h1 = this.handleLineMeshes[i * 2]
-      const h2 = this.handleLineMeshes[i * 2 + 1]
-      const positions1 = new Float32Array([p.co[0], p.co[1], p.co[2], p.h1[0], p.h1[1], p.h1[2]])
-      const positions2 = new Float32Array([p.co[0], p.co[1], p.co[2], p.h2[0], p.h2[1], p.h2[2]])
-      h1.geometry.setAttribute('position', new BufferAttribute(positions1, 3))
-      h2.geometry.setAttribute('position', new BufferAttribute(positions2, 3))
-      h1.geometry.computeBoundingSphere()
-      h2.geometry.computeBoundingSphere()
+      const base = i * 12
+      segPositions[base]     = p.co[0]
+      segPositions[base + 1] = p.co[1]
+      segPositions[base + 2] = p.co[2]
+      segPositions[base + 3] = p.h1[0]
+      segPositions[base + 4] = p.h1[1]
+      segPositions[base + 5] = p.h1[2]
+      segPositions[base + 6] = p.co[0]
+      segPositions[base + 7] = p.co[1]
+      segPositions[base + 8] = p.co[2]
+      segPositions[base + 9]  = p.h2[0]
+      segPositions[base + 10] = p.h2[1]
+      segPositions[base + 11] = p.h2[2]
+      // Sync the dot meshes too.
       const dot1 = this.handleDotMeshes[i * 2]
       const dot2 = this.handleDotMeshes[i * 2 + 1]
       dot1.position.set(p.h1[0], p.h1[1], p.h1[2])
@@ -230,9 +302,15 @@ export class ScenePathEditor {
       dot1.userData = { kind: 'h1', pointIdx: i }
       dot2.userData = { kind: 'h2', pointIdx: i }
     }
+    // Same pattern as updateSplineGeometry: replace rather than reuse.
+    this.handleSegments.geometry.dispose()
+    const geo = new LineSegmentsGeometry()
+    geo.setPositions(segPositions as unknown as number[])
+    this.handleSegments.geometry = geo
   }
 
   private updateColors (): void {
+    const activeIdx = this.active?.pointIdx
     for (let i = 0; i < this.anchorMeshes.length; i++) {
       const mat = this.anchorMeshes[i].material as MeshBasicMaterial
       const isActive = this.active?.kind === 'anchor' && this.active.pointIdx === i
@@ -246,23 +324,41 @@ export class ScenePathEditor {
       const isActive = this.active?.kind === kind && this.active.pointIdx === idx
       const isHover = this.hovered?.kind === kind && this.hovered.pointIdx === idx
       mat.color.copy(isActive ? COLOR_ANCHOR_ACTIVE : isHover ? COLOR_ANCHOR_HOVER : COLOR_HANDLE_DOT)
+      mat.opacity = activeIdx === idx ? 1.0 : 0.35
     }
+    this.updateActiveHandleOverlay(activeIdx)
   }
 
-  /** Pick the nearest anchor/handle under the pointer. Anchors take priority
-   * over handles within the ray tolerance. */
+  private updateActiveHandleOverlay (activeIdx: number | undefined): void {
+    if (activeIdx === undefined || activeIdx < 0 || activeIdx >= this.path.points.length) {
+      this.activeHandleSegments.visible = false
+      return
+    }
+    const p = this.path.points[activeIdx]
+    const bars = new Float32Array([
+      p.co[0], p.co[1], p.co[2], p.h1[0], p.h1[1], p.h1[2],
+      p.co[0], p.co[1], p.co[2], p.h2[0], p.h2[1], p.h2[2],
+    ])
+    this.activeHandleSegments.geometry.dispose()
+    const geo = new LineSegmentsGeometry()
+    geo.setPositions(bars as unknown as number[])
+    this.activeHandleSegments.geometry = geo
+    this.activeHandleSegments.visible = true
+  }
+
+  /** Pick the nearest anchor/handle under the pointer. */
   pick (clientX: number, clientY: number): PathHit | null {
     const rect = this.dom.getBoundingClientRect()
     this.ndc.x = ((clientX - rect.left) / rect.width)  * 2 - 1
     this.ndc.y = -((clientY - rect.top)  / rect.height) * 2 + 1
-    this.camera.updateMatrixWorld()  // raycaster reads matrixWorldInverse
+    this.camera.updateMatrixWorld()
     this.raycaster.setFromCamera(this.ndc, this.camera)
 
     const targets: Object3D[] = [...this.anchorMeshes, ...this.handleDotMeshes]
     const hits = this.raycaster.intersectObjects(targets, false)
     if (hits.length === 0) return null
-    // Prefer anchors within a small tolerance — they sit slightly behind
-    // handles in screen space, otherwise handles always win.
+    // Prefer anchors when in range — handles otherwise pre-empt them since
+    // they sit slightly in front in screen space.
     const anchorHit = hits.find((h) => (h.object.userData?.kind as HitKind) === 'anchor')
     const first = hits[0]
     const chosen = anchorHit && (anchorHit.distance - first.distance) < this.anchorRadius
@@ -275,8 +371,7 @@ export class ScenePathEditor {
 
   private onPointerMove (e: PointerEvent): void {
     if (this.dragState && this.active) {
-      this.applyDrag(e.clientX, e.clientY)
-      // Swallow during drag so OrbitControls doesn't also see it.
+      this.applyDrag(e.clientX, e.clientY, e.shiftKey)
       e.stopPropagation()
       e.preventDefault()
       return
@@ -286,6 +381,23 @@ export class ScenePathEditor {
       this.hovered = hit
       this.updateColors()
     }
+    if (hit) {
+      this.setGhost(null)
+    } else {
+      this.setGhost(this.pickSpline(e.clientX, e.clientY))
+    }
+  }
+
+  private setGhost (g: { segIdx: number; t: number } | null): void {
+    this.ghostInsert = g
+    if (!g) {
+      this.ghostMesh.visible = false
+      return
+    }
+    const u = g.segIdx + g.t
+    const p = pathPos(this.path, u)
+    this.ghostMesh.position.set(p[0], p[1], p[2])
+    this.ghostMesh.visible = true
   }
 
   private onPointerDown (e: PointerEvent): void {
@@ -298,7 +410,6 @@ export class ScenePathEditor {
     }
     if (e.button !== 0) return
 
-    // Ctrl+click inserts a new control point via de Casteljau split.
     if (e.ctrlKey || e.metaKey) {
       const ins = this.pickSpline(e.clientX, e.clientY)
       if (ins !== null) {
@@ -321,10 +432,20 @@ export class ScenePathEditor {
       }
       window.addEventListener('keydown', this.boundOnKeyDown)
       try { this.dom.setPointerCapture(e.pointerId) } catch { /* jsdom may not support */ }
+      this.setGhost(null)
       this.updateColors()
-      // Swallow so OrbitControls doesn't also start a camera drag.
       e.stopPropagation()
       e.preventDefault()
+    } else if (this.ghostInsert) {
+      const g = this.ghostInsert
+      this.insertPoint(g.segIdx, g.t)
+      this.setGhost(null)
+      e.stopPropagation()
+      e.preventDefault()
+    } else if (this.active) {
+      // Don't stopPropagation — let OrbitControls orbit/pan on empty click.
+      this.active = null
+      this.updateColors()
     }
   }
 
@@ -337,25 +458,42 @@ export class ScenePathEditor {
     this.ndc.y = -((clientY - rect.top)  / rect.height) * 2 + 1
     this.camera.updateMatrixWorld()
     this.raycaster.setFromCamera(this.ndc, this.camera)
-    // Generous Line threshold scaled to bounding sphere — pixel-perfect aim
-    // would be too strict on screens of any size.
-    const sphere = this.splineLine.geometry.boundingSphere
-    const threshold = sphere ? Math.max(sphere.radius * 0.05, 0.05) : 0.1
-    const prev = this.raycaster.params.Line?.threshold
-    this.raycaster.params.Line = { ...this.raycaster.params.Line, threshold }
+    // Line2 threshold is in screen pixels (added to half the line width).
+    const params = this.raycaster.params as { Line2?: { threshold: number } }
+    const prev = params.Line2?.threshold
+    params.Line2 = { ...(params.Line2 ?? {}), threshold: 8 }
     const hits = this.raycaster.intersectObject(this.splineLine, false)
-    if (prev !== undefined) this.raycaster.params.Line!.threshold = prev
+    if (prev !== undefined) params.Line2!.threshold = prev
     if (hits.length === 0) return null
-    const idx = hits[0].index ?? 0
-    const total = segs * this.resolution + 1
-    const u = (idx / (total - 1)) * segs
+    const hit = hits[0] as { faceIndex?: number; pointOnLine?: Vector3 }
+    const faceIdx = hit.faceIndex ?? 0
+
+    // Continuous sub-edge param so (segIdx, t) doesn't snap to the polyline
+    // grid — mirrors Blender's get_updated_data_for_edge (editcurve_pen.cc:710).
+    let s = 0
+    const start = this.splineLine.geometry.attributes.instanceStart
+    const end = this.splineLine.geometry.attributes.instanceEnd
+    if (hit.pointOnLine && start && end && faceIdx < start.count) {
+      const ax = start.getX(faceIdx), ay = start.getY(faceIdx), az = start.getZ(faceIdx)
+      const bx = end.getX(faceIdx),   by = end.getY(faceIdx),   bz = end.getZ(faceIdx)
+      const dx = bx - ax, dy = by - ay, dz = bz - az
+      const lenSq = dx * dx + dy * dy + dz * dz
+      if (lenSq > 1e-12) {
+        const px = hit.pointOnLine.x - ax
+        const py = hit.pointOnLine.y - ay
+        const pz = hit.pointOnLine.z - az
+        s = (px * dx + py * dy + pz * dz) / lenSq
+        if (s < 0) s = 0
+        else if (s > 1) s = 1
+      }
+    }
+
+    const u = (faceIdx + s) / this.resolution
     const segIdx = Math.min(segs - 1, Math.floor(u))
     return { segIdx, t: u - segIdx }
   }
 
-  /** de Casteljau split at `t` in segment `segIdx`. Inserts a new control
-   * point with handles that preserve curve shape (mirrors
-   * BKE_fcurve_bezt_subdivide_handles). */
+  /** de Casteljau split at `t` in segment `segIdx`. Shape-preserving. */
   insertPoint (segIdx: number, t: number): number {
     const N = this.path.points.length
     if (N < 2) return -1
@@ -363,18 +501,15 @@ export class ScenePathEditor {
     const b = this.path.points[(segIdx + 1) % N]
     const lerp = (p: Vec3Tuple, q: Vec3Tuple): Vec3Tuple =>
       [p[0] * (1 - t) + q[0] * t, p[1] * (1 - t) + q[1] * t, p[2] * (1 - t) + q[2] * t]
-    // Control polygon: P0 = a.co, P1 = a.h2, P2 = b.h1, P3 = b.co.
-    const p1 = lerp(a.co, a.h2)            // new a.h2
+    const p1 = lerp(a.co, a.h2)
     const p12 = lerp(a.h2, b.h1)
     const p23 = lerp(b.h1, b.co)
-    const p2 = lerp(p1, p12)               // mid.h1
-    const p3 = lerp(p12, p23)              // mid.h2
-    const mid = lerp(p2, p3)               // new anchor
-    const newH1ForB = p23                  // new b.h1
+    const p2 = lerp(p1, p12)
+    const p3 = lerp(p12, p23)
+    const mid = lerp(p2, p3)
+    const newH1ForB = p23
 
     const newPoint: SplinePoint = { co: mid, h1: p2, h2: p3 }
-    // Interpolate tilt at split so attributes don't break discontinuously
-    // across insert (Blender subdivideNurb editcurve.cc:3587-3589).
     const aTilt = a.tilt ?? 0
     const bTilt = b.tilt ?? 0
     const midTilt = aTilt * (1 - t) + bTilt * t
@@ -390,23 +525,162 @@ export class ScenePathEditor {
     this.active = { kind: 'anchor', pointIdx: insertAt }
     this.refresh()
     this.onChanged()
+    this.onCommit('insert spline point')
     return insertAt
   }
 
-  /** Set per-point baseline tilt (banking) in radians. PathFollow's
-   * `tiltCurve` adds time-varying roll on top. */
+  /** Cycle the active anchor's handle types together (h1 + h2 in lockstep)
+   * through AUTO → VECTOR → ALIGN → FREE. AUTO and VECTOR also re-snap
+   * the handle positions so the new constraint takes effect immediately;
+   * ALIGN and FREE keep current positions. No-op when nothing is active.
+   * Returns the type just applied, or `null` if nothing changed. */
+  cycleActiveHandleType (): HandleType | null {
+    if (!this.active) return null
+    const idx = this.active.pointIdx
+    const p = this.path.points[idx]
+    if (!p) return null
+    const next = nextHandleType(h1Type(p))
+    p.h1Type = next
+    p.h2Type = next
+    recalcSplineHandle(this.path, idx)
+    this.refresh()
+    this.onChanged()
+    this.onCommit(`handle type → ${next}`)
+    return next
+  }
+
+  /** Extrude a new anchor from the active endpoint along the current
+   * tangent. Mirrors Blender's curve.extrude_move (E key). */
+  extrudeFromActiveEndpoint (): number {
+    if (!this.active || this.active.kind !== 'anchor') return -1
+    if (this.path.closed) return -1
+    const idx = this.active.pointIdx
+    const N = this.path.points.length
+    const isFirst = idx === 0
+    const isLast = idx === N - 1
+    if (!isFirst && !isLast) return -1
+
+    const p = this.path.points[idx]
+    const ax = isLast ? p.co[0] - p.h1[0] : p.co[0] - p.h2[0]
+    const ay = isLast ? p.co[1] - p.h1[1] : p.co[1] - p.h2[1]
+    const az = isLast ? p.co[2] - p.h1[2] : p.co[2] - p.h2[2]
+    let tlen = Math.hypot(ax, ay, az)
+    let tx = 1, ty = 0, tz = 0
+    if (tlen > 1e-6) { tx = ax / tlen; ty = ay / tlen; tz = az / tlen }
+    const step = Math.max(tlen * 3, 0.5)
+    const newCo: Vec3Tuple = [p.co[0] + tx * step, p.co[1] + ty * step, p.co[2] + tz * step]
+    const newPoint: SplinePoint = {
+      co: newCo,
+      h1: [newCo[0] - tx * step / 3, newCo[1] - ty * step / 3, newCo[2] - tz * step / 3],
+      h2: [newCo[0] + tx * step / 3, newCo[1] + ty * step / 3, newCo[2] + tz * step / 3],
+      h1Type: HandleType.AUTO,
+      h2Type: HandleType.AUTO,
+    }
+    if (isLast) {
+      this.path.points.push(newPoint)
+      this.active = { kind: 'anchor', pointIdx: this.path.points.length - 1 }
+    } else {
+      this.path.points.unshift(newPoint)
+      this.active = { kind: 'anchor', pointIdx: 0 }
+    }
+    // The old endpoint just gained an interior neighbor — resnap AUTO handles.
+    recalcAllSplineHandles(this.path)
+    this.refresh()
+    this.onChanged()
+    this.onCommit('extrude spline endpoint')
+    return this.active.pointIdx
+  }
+
+  /** Reverse point order; mirrors BKE_nurb_direction_switch. */
+  switchDirection (): void {
+    const N = this.path.points.length
+    if (N < 2) return
+    this.path.points.reverse()
+    for (const p of this.path.points) {
+      const tmpH = p.h1; p.h1 = p.h2; p.h2 = tmpH
+      const tmpT = p.h1Type; p.h1Type = p.h2Type; p.h2Type = tmpT
+      if (p.tilt !== undefined && p.tilt !== 0) p.tilt = -p.tilt
+    }
+    if (this.active) {
+      this.active = { ...this.active, pointIdx: N - 1 - this.active.pointIdx }
+    }
+    this.refresh()
+    this.onChanged()
+    this.onCommit('switch spline direction')
+  }
+
+  /** Remove a point but refit the neighbor handles to keep curve shape.
+   * Approximation of Blender's CURVE_OT_dissolve_verts (no Schneider fit). */
+  dissolvePoint (idx: number): boolean {
+    const N = this.path.points.length
+    if (N <= 2) return false
+    const prevIdx = idx > 0 ? idx - 1 : (this.path.closed ? N - 1 : -1)
+    const nextIdx = idx < N - 1 ? idx + 1 : (this.path.closed ? 0 : -1)
+    if (prevIdx < 0 || nextIdx < 0) return false
+
+    const prev = this.path.points[prevIdx]
+    const next = this.path.points[nextIdx]
+    const chord = Math.hypot(next.co[0] - prev.co[0], next.co[1] - prev.co[1], next.co[2] - prev.co[2])
+    const targetLen = chord / 3
+
+    const reproject = (anchor: Vec3Tuple, handle: Vec3Tuple): Vec3Tuple => {
+      const dx = handle[0] - anchor[0], dy = handle[1] - anchor[1], dz = handle[2] - anchor[2]
+      const l = Math.hypot(dx, dy, dz)
+      if (l < 1e-9) {
+        const cx = next.co[0] - prev.co[0], cy = next.co[1] - prev.co[1], cz = next.co[2] - prev.co[2]
+        const cl = Math.hypot(cx, cy, cz) || 1
+        const sign = anchor === prev.co ? 1 : -1
+        return [anchor[0] + sign * cx / cl * targetLen, anchor[1] + sign * cy / cl * targetLen, anchor[2] + sign * cz / cl * targetLen]
+      }
+      return [anchor[0] + dx / l * targetLen, anchor[1] + dy / l * targetLen, anchor[2] + dz / l * targetLen]
+    }
+    prev.h2 = reproject(prev.co, prev.h2)
+    next.h1 = reproject(next.co, next.h1)
+
+    // AUTO → ALIGN / VECTOR → FREE so a future recalc doesn't undo the fit.
+    const promote = (t: HandleType | undefined): HandleType => {
+      const cur = t ?? HandleType.AUTO
+      if (cur === HandleType.FREE || cur === HandleType.ALIGN) return cur
+      return cur === HandleType.VECTOR ? HandleType.FREE : HandleType.ALIGN
+    }
+    prev.h2Type = promote(prev.h2Type)
+    next.h1Type = promote(next.h1Type)
+
+    this.path.points.splice(idx, 1)
+    if (this.active?.pointIdx === idx) this.active = null
+    else if (this.active && this.active.pointIdx > idx) {
+      this.active = { ...this.active, pointIdx: this.active.pointIdx - 1 }
+    }
+    this.refresh()
+    this.onChanged()
+    this.onCommit('dissolve spline point')
+    return true
+  }
+
+  /** Flip the spline between open and closed (cyclic). Resnaps every
+   * AUTO/VECTOR handle since the neighbor topology at the seam changed
+   * (open endpoints have only one neighbor; closed wrap around). */
+  toggleClosed (): boolean {
+    this.path.closed = !this.path.closed
+    recalcAllSplineHandles(this.path)
+    this.refresh()
+    this.onChanged()
+    this.onCommit(this.path.closed ? 'close spline' : 'open spline')
+    return this.path.closed
+  }
+
+  /** Set per-point baseline tilt (banking) in radians. */
   setPointTilt (idx: number, radians: number): void {
     const p = this.path.points[idx]
     if (!p) return
+    const prev = p.tilt ?? 0
     if (radians === 0) delete p.tilt
     else p.tilt = radians
     this.onChanged()
+    if (Math.abs(prev - radians) > 1e-9) this.onCommit('set anchor tilt')
   }
 
-  /** Remove a control point — plain splice (Blender CURVE_OT_delete). The
-   * curve through the gap snaps to the existing neighbor handles; for shape
-   * preservation, a future dissolvePoint will refit a cubic across the gap
-   * (CURVE_OT_dissolve_verts, editcurve.cc:6660-6722). */
+  /** Remove a control point. For shape-preserving removal use dissolvePoint. */
   deletePoint (idx: number): boolean {
     if (idx < 0 || idx >= this.path.points.length) return false
     if (this.path.points.length <= 1) return false
@@ -415,22 +689,40 @@ export class ScenePathEditor {
     else if (this.active && this.active.pointIdx > idx) this.active = { ...this.active, pointIdx: this.active.pointIdx - 1 }
     this.refresh()
     this.onChanged()
+    this.onCommit('delete spline point')
     return true
   }
 
   private onPointerUp (e: PointerEvent): void {
-    if (this.dragState) {
-      this.dragState = null
-      window.removeEventListener('keydown', this.boundOnKeyDown)
-      try { this.dom.releasePointerCapture(e.pointerId) } catch { /* jsdom may not support */ }
-      e.stopPropagation()
-      this.onChanged()
+    if (!this.dragState || !this.active) return
+    // Plain click (no movement) shouldn't push an undo step.
+    const ds = this.dragState
+    const p = this.path.points[this.active.pointIdx]
+    let moved = false
+    if (p) {
+      const cur = this.active.kind === 'anchor' ? p.co
+                : this.active.kind === 'h1'     ? p.h1
+                                                : p.h2
+      const start = this.active.kind === 'anchor' ? ds.startCo
+                  : this.active.kind === 'h1'     ? ds.startH1
+                                                  : ds.startH2
+      moved = Math.abs(cur[0] - start[0]) > 1e-9
+           || Math.abs(cur[1] - start[1]) > 1e-9
+           || Math.abs(cur[2] - start[2]) > 1e-9
+    }
+    const kind = this.active.kind
+    this.dragState = null
+    window.removeEventListener('keydown', this.boundOnKeyDown)
+    try { this.dom.releasePointerCapture(e.pointerId) } catch { /* jsdom may not support */ }
+    e.stopPropagation()
+    this.onChanged()
+    if (moved) {
+      this.onCommit(kind === 'anchor' ? 'move spline anchor' : 'move spline handle')
     }
   }
 
-  // Drag-time keys: X/Y/Z axis-lock, Shift+X/Y/Z plane-lock, Escape cancels.
-  // Outside drag, hosts wire their own delete/insert keys — this class
-  // doesn't grab global keys, to avoid focus-leak problems.
+  // Drag-time keys: X/Y/Z axis-lock, Shift+X/Y/Z plane-lock, Esc cancels.
+  // Outside drag, hosts wire their own delete/insert keys.
   private onKeyDown (e: KeyboardEvent): void {
     if (!this.dragState) return
     if (e.key === 'Escape' || e.key === 'Esc') {
@@ -455,9 +747,8 @@ export class ScenePathEditor {
     e.preventDefault()
   }
 
-  // Escape / right-click during drag: restore drag-start position. Mirrors
-  // Blender's modal-transform cancel. Does NOT call onChanged — path is
-  // back where it started.
+  // Esc / right-click during drag → restore drag-start position. Doesn't
+  // emit onChanged since the path is back where it was.
   private cancelDrag (): void {
     if (!this.dragState || !this.active) return
     const p = this.path.points[this.active.pointIdx]
@@ -484,7 +775,6 @@ export class ScenePathEditor {
     const cn = this.dragState.constraint
 
     if (cn.kind === 'free') {
-      // Plane through start, normal = camera forward.
       const camFwd = this.tmpV2
       this.camera.getWorldDirection(camFwd)
       this.tmpPlane.setFromNormalAndCoplanarPoint(camFwd, startV)
@@ -517,7 +807,7 @@ export class ScenePathEditor {
     ]
   }
 
-  private applyDrag (clientX: number, clientY: number): void {
+  private applyDrag (clientX: number, clientY: number, shiftKey = false): void {
     if (!this.dragState || !this.active) return
     const newPos = this.projectPointer(clientX, clientY)
     if (!newPos) return
@@ -532,8 +822,10 @@ export class ScenePathEditor {
       p.h2 = [this.dragState.startH2[0] + dx, this.dragState.startH2[1] + dy, this.dragState.startH2[2] + dz]
     } else if (this.active.kind === 'h1') {
       p.h1 = [newPos[0], newPos[1], newPos[2]]
+      applyAlignAfterDrag(p, 'h1', shiftKey)
     } else {
       p.h2 = [newPos[0], newPos[1], newPos[2]]
+      applyAlignAfterDrag(p, 'h2', shiftKey)
     }
     this.refresh()
   }

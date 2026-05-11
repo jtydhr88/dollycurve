@@ -43,6 +43,14 @@ export { CameraTrackBinding } from './three/CameraTrackBinding'
 export { ScenePathEditor } from './editor/ScenePathEditor'
 export type { ScenePathEditorOptions, PathHit, HitKind } from './editor/ScenePathEditor'
 export { bezierSegmentPos, bezierSegmentTan, pathPos, pathTangent, segmentCount } from './spline/bezier3d'
+export {
+  applyAlignAfterDrag,
+  h1Type as splinePointH1Type,
+  h2Type as splinePointH2Type,
+  nextHandleType as nextSplineHandleType,
+  recalcAllSplineHandles,
+  recalcSplineHandle,
+} from './spline/handles'
 export { buildArcTable, arcLengthToU, uToArcLength } from './spline/arc-length'
 export type { ArcTable } from './spline/arc-length'
 export { buildFrames, frameAtU, frameToQuaternion } from './spline/orientation'

@@ -1,24 +1,42 @@
-// Best-effort conversion from location FCurves to a SplinePath. One anchor
-// per unique source-key time; tangents via central finite differences,
-// handles 1/3 of the way to neighbors. Simpler than Schneider's iterative
-// curve-fit (Blender's "Convert Animation to Curve") — for dense baked
-// input, pre-decimate the source for a tighter fit.
+// Convert location FCurves → SplinePath, one anchor per unique key time.
 
-import { CameraAction, FCurve, SplinePath, Vec3 } from '../data/types'
+import { BezTriple, CameraAction, FCurve, SplinePath, Vec3 } from '../data/types'
 import { makeSplinePath } from '../data/factories'
 import { evaluateFCurve } from '../eval/evaluate'
 
 export interface FitPathOptions {
-  /** Remove source location FCurves from the action after conversion. Default true. */
+  /** Remove source location FCurves after conversion. Default true. */
   consumeFCurves?: boolean
-  /** Centered-difference window for tangent approximation, in frames. Default 0.5. */
+  /** Central-diff window for tangent approximation, in frames. Default 0.5. */
   tangentEpsilon?: number
-  /** Restrict to [minFrame, maxFrame] inclusive. */
   minFrame?: number
   maxFrame?: number
-  /** Uniform anchor count over the frame range; useful when the source is
-   *  densely baked. Minimum 2. */
+  /** Uniform anchor count instead of 1-per-key. Min 2; suppresses useFCurveHandles. */
   targetCount?: number
+  /** Read 3D handles from each axis's bezt handles when an anchor frame
+   *  matches an existing key (fallback: central diff). Default true. */
+  useFCurveHandles?: boolean
+}
+
+const FRAME_EPS = 1e-3
+
+function findBeztAtFrame (fcu: FCurve, frame: number): BezTriple | null {
+  for (const b of fcu.bezt) {
+    if (Math.abs(b.vec[1][0] - frame) < FRAME_EPS) return b
+  }
+  return null
+}
+
+function leftSlope (b: BezTriple): number {
+  const dx = b.vec[1][0] - b.vec[0][0]
+  if (Math.abs(dx) < 1e-9) return 0
+  return (b.vec[1][1] - b.vec[0][1]) / dx
+}
+
+function rightSlope (b: BezTriple): number {
+  const dx = b.vec[2][0] - b.vec[1][0]
+  if (Math.abs(dx) < 1e-9) return 0
+  return (b.vec[2][1] - b.vec[1][1]) / dx
 }
 
 function locationFCurves (action: CameraAction): [FCurve | null, FCurve | null, FCurve | null] {
@@ -48,7 +66,7 @@ function evalLocation (loc: [FCurve | null, FCurve | null, FCurve | null], frame
   ]
 }
 
-/** Fit a SplinePath through the action's location FCurves. Does NOT install
+/** Fit a SplinePath through the action's location FCurves. Doesn't install
  * it as `action.pathFollow` — caller composes the PathFollowConstraint. */
 export function fitFCurvesToPath (action: CameraAction, opts: FitPathOptions = {}): SplinePath {
   const eps = opts.tangentEpsilon ?? 0.5
@@ -75,23 +93,37 @@ export function fitFCurvesToPath (action: CameraAction, opts: FitPathOptions = {
     }
   }
 
+  // Resampled frames don't lie on real keys → handle reads would all miss.
+  const useHandles = (opts.useFCurveHandles ?? true) && opts.targetCount === undefined
+
   const points = frames.map((f, i) => {
     const co = evalLocation(loc, f)
-    const before = evalLocation(loc, f - eps)
-    const after  = evalLocation(loc, f + eps)
-    const tan: Vec3 = [
-      (after[0] - before[0]) / (2 * eps),
-      (after[1] - before[1]) / (2 * eps),
-      (after[2] - before[2]) / (2 * eps),
-    ]
+    const lt: [number, number, number] = [0, 0, 0]
+    const rt: [number, number, number] = [0, 0, 0]
+    for (let a = 0; a < 3; a++) {
+      const fcu = loc[a]
+      const b = useHandles && fcu ? findBeztAtFrame(fcu, f) : null
+      if (b) {
+        lt[a] = leftSlope(b)
+        rt[a] = rightSlope(b)
+      } else {
+        const valBefore = fcu ? evaluateFCurve(fcu, f - eps) : 0
+        const valAfter  = fcu ? evaluateFCurve(fcu, f + eps) : 0
+        const slope = (valAfter - valBefore) / (2 * eps)
+        lt[a] = slope
+        rt[a] = slope
+      }
+    }
     const prevGap = i > 0 ? f - frames[i - 1] : (frames[1] - f)
     const nextGap = i < frames.length - 1 ? frames[i + 1] - f : prevGap
+    // 3D bezier tangent at t=0 is 3*(h2-co); matching FCurve per-frame
+    // velocity puts the handle at slope*gap/3 from anchor.
     const h1Scale = prevGap / 3
     const h2Scale = nextGap / 3
     return {
       co,
-      h1: [co[0] - tan[0] * h1Scale, co[1] - tan[1] * h1Scale, co[2] - tan[2] * h1Scale] as Vec3,
-      h2: [co[0] + tan[0] * h2Scale, co[1] + tan[1] * h2Scale, co[2] + tan[2] * h2Scale] as Vec3,
+      h1: [co[0] - lt[0] * h1Scale, co[1] - lt[1] * h1Scale, co[2] - lt[2] * h1Scale] as Vec3,
+      h2: [co[0] + rt[0] * h2Scale, co[1] + rt[1] * h2Scale, co[2] + rt[2] * h2Scale] as Vec3,
     }
   })
 

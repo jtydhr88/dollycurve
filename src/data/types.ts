@@ -101,15 +101,16 @@ export interface CameraActionMetadata {
 
 export type Vec3 = [number, number, number]
 
-/** A single 3D bezier control point. Same role as BezTriple but in 3D
- * space (paths live in world coords, not time/value). `tilt` is roll
- * around the path tangent at this point — a baseline banking that the
- * orientation pass uses; can be further animated by PathFollowConstraint.tiltCurve. */
+/** A 3D bezier control point. `tilt` is roll around the path tangent in
+ * radians. Handle types mirror Blender's BezTriple semantics in 3D
+ * (AUTO / VECTOR / ALIGN / FREE / AUTO_CLAMPED); default is AUTO. */
 export interface SplinePoint {
-  co: Vec3   // anchor
+  co: Vec3
   h1: Vec3   // left handle (back along the path)
   h2: Vec3   // right handle (forward along the path)
-  tilt?: number  // radians; 0 = no banking. Default 0.
+  h1Type?: HandleType
+  h2Type?: HandleType
+  tilt?: number
 }
 
 /** A 3D bezier spline. Closed=true wraps the last segment to the first. */

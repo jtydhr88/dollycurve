@@ -209,6 +209,27 @@
         box-shadow: 0 1px 0 rgba(0,0,0,0.5);
       }
 
+      /* Picture-in-picture viewport: bottom-right preview of what the
+         path camera (previewCam) sees, rendered into the main canvas
+         via scissor+viewport. The DOM element is just a border + label
+         overlay aligned to that scissor rect. */
+      #pip {
+        position: absolute; right: 12px; bottom: 12px;
+        width: 280px; height: 158px;
+        border: 2px solid #ff8c00;
+        box-sizing: border-box;
+        pointer-events: none;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+      }
+      #pip .pip-label {
+        position: absolute; top: -16px; left: 0;
+        font: 10px ui-monospace, monospace;
+        color: #ff8c00;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        text-shadow: 0 1px 2px rgba(0,0,0,0.7);
+      }
+
       /* Inline gizmo controls in the scrubber bar. */
       #gizmo-radios { display: inline-flex; gap: 6px; align-items: center; }
       #gizmo-radios.disabled { opacity: 0.4; pointer-events: none; }
@@ -238,10 +259,15 @@
             <span class="help-keys"><kbd>A</kbd> select all · <kbd>X</kbd> delete · <kbd>T</kbd>/<kbd>V</kbd> cycle ipo/handle · <kbd>F</kbd>/<kbd>Shift+F</kbd> frame all/sel · <kbd>Shift+K</kbd> column</span>
           </div>
           <div class="help-section">
+            <span class="help-key">Spline</span>
+            <span class="help-keys">click anchor · <kbd>X</kbd>/<kbd>Del</kbd> delete · <kbd>Ctrl+X</kbd> dissolve · <kbd>E</kbd> extrude · <kbd>V</kbd> cycle handle · <kbd>F</kbd> flip dir · <kbd>Alt+C</kbd> open/close · <kbd>Alt+T</kbd> clear tilt · <kbd>Esc</kbd> deselect · click curve to insert · <kbd>Shift</kbd>+drag = invert align/free</span>
+          </div>
+          <div class="help-section">
             <span class="help-key">Edit</span>
             <span class="help-keys"><kbd>Ctrl+Z</kbd> undo · <kbd>Ctrl+Shift+Z</kbd> redo · auto-saves to browser</span>
           </div>
         </details>
+        <div id="pip"><span class="pip-label">Camera</span></div>
       </div>
       <details id="panel" open>
         <summary><b>Camera Keyframes</b></summary>
@@ -256,25 +282,31 @@
             <input id="load-json-input" type="file" accept=".json,application/json" style="display:none" />
             <button id="clear-kf">Clear all</button>
           </div>
-          <!-- Path mode UI hidden until the spline editor is more polished;
-               implementation stays wired (main.ts still listens to these
-               controls when they exist). Re-enable by removing the wrapper. -->
-          <div style="display: none;">
-            <h2 style="margin-top: 14px;">Path Mode</h2>
-            <div class="row">
-              <label class="ckp-inline-label" style="font-size: 12px; color: #ddd;">
-                <input id="path-mode" type="checkbox" /> Edit as 3D spline
-              </label>
+          <!-- Spline tools always live in the sidebar. Fit → Path enters
+               spline-edit mode (auto-creates pathFollow + spawns the 3D
+               editor); Bake → FCurves leaves it. The active-anchor row
+               only appears once an anchor is selected. -->
+          <div id="spline-tools">
+            <h2 style="margin-top: 14px;">Spline</h2>
+            <div class="row" style="gap: 6px; align-items: center;">
+              <button id="fit-path" title="Fit a spline through existing location keyframes (one anchor per key by default)" style="min-width: 100px;">Fit → Path</button>
+              <label class="ckp-inline-label" style="font-size: 11px; color: #aaa;" title="Optional: uniformly resample to N anchors instead of one-per-key. Leave blank to preserve existing keyframes 1:1.">resample</label>
+              <input id="fit-count" type="number" min="2" max="100" step="1" placeholder="off" style="width: 50px;" />
+            </div>
+            <div class="row" id="path-controls" style="gap: 6px; align-items: center;">
+              <button id="bake-path" title="Spline → location/rotation FCurves. Default: one keyframe per spline anchor (round-trips with Fit → Path). Set the count to override with a uniform resample." style="min-width: 100px;">Bake → FCurves</button>
+              <label class="ckp-inline-label" style="font-size: 11px; color: #aaa;" title="Optional: uniformly resample to N keyframes instead of one-per-anchor. Leave blank to preserve the spline's anchor count.">resample</label>
+              <input id="bake-count" type="number" min="2" max="500" step="1" placeholder="anchors" style="width: 60px;" />
             </div>
             <div class="row" style="gap: 6px; align-items: center;">
-              <button id="fit-path" title="Fit a spline through existing location FCurves" style="min-width: 100px;">Fit → Path</button>
-              <label class="ckp-inline-label" style="font-size: 11px; color: #aaa;">anchors</label>
-              <input id="fit-count" type="number" min="2" max="100" step="1" value="5" style="width: 50px;" />
+              <label class="ckp-inline-label" style="font-size: 12px; color: #ddd;" title="If checked, the baked rotation aims the camera at the scene origin (or action.metadata.subjectTarget if set) instead of following the path tangent.">
+                <input id="bake-look-at-center" type="checkbox" checked /> Look at center
+              </label>
             </div>
-            <div class="row" id="path-controls" style="display: none; gap: 6px; align-items: center;">
-              <button id="bake-path" title="Sample path → location/rotation FCurves" style="min-width: 100px;">Bake → FCurves</button>
-              <label class="ckp-inline-label" style="font-size: 11px; color: #aaa;">keys</label>
-              <input id="bake-count" type="number" min="2" max="500" step="1" value="20" style="width: 50px;" />
+            <div class="row" id="active-anchor-row" style="gap: 6px; align-items: center; display: none;">
+              <label class="ckp-inline-label" style="font-size: 11px; color: #aaa;" title="Roll around the path tangent at the active anchor, in degrees. Used by PathFollow's banking pass.">tilt°</label>
+              <input id="anchor-tilt" type="number" step="1" placeholder="0" style="width: 60px;" title="Active anchor tilt (degrees). Alt+T clears to 0." />
+              <span id="active-anchor-label" style="font-size: 11px; color: #888; font-family: ui-monospace, monospace;"></span>
             </div>
           </div>
           <div id="keyframes"></div>
@@ -306,6 +338,7 @@
           <div class="ckp-divider"></div>
           <label class="ckp-inline-label"><input id="show-helper" type="checkbox" checked /> Cam helper</label>
           <label class="ckp-inline-label"><input id="preview-toggle" type="checkbox" /> Preview cam</label>
+          <label class="ckp-inline-label"><input id="pip-toggle" type="checkbox" checked /> PiP</label>
           <div class="ckp-divider"></div>
           <label class="ckp-inline-label"><input id="gizmo-enable" type="checkbox" /> Gizmo</label>
           <span id="gizmo-radios" class="disabled">

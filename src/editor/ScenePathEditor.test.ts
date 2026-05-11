@@ -244,4 +244,119 @@ describe('ScenePathEditor', () => {
     expect(editor.getActive()).toBeNull()
     editor.destroy()
   })
+
+  it('switchDirection reverses point order, swaps h1↔h2, negates tilt', () => {
+    const scene = new Scene()
+    const camera = new PerspectiveCamera(45, 800 / 600, 0.1, 100)
+    const dom = makeHostDom()
+    const path = makeSplinePath([
+      makeSplinePoint([0, 0, 0], [1, 0, 0], 1, Math.PI / 4),
+      makeSplinePoint([5, 0, 0], [1, 0, 0]),
+      makeSplinePoint([10, 0, 0], [1, 0, 0], 1, -Math.PI / 6),
+    ])
+    const originalP0H1 = [...path.points[0].h1]
+    const originalP0H2 = [...path.points[0].h2]
+    const editor = new ScenePathEditor(path, { scene, camera, dom, path })
+    editor.switchDirection()
+    // What was index 0 is now index 2.
+    expect(path.points[2].co).toEqual([0, 0, 0])
+    expect(path.points[0].co).toEqual([10, 0, 0])
+    // h1 ↔ h2 swap on the (now last) original first point.
+    expect(path.points[2].h1).toEqual(originalP0H2)
+    expect(path.points[2].h2).toEqual(originalP0H1)
+    // Tilts negated.
+    expect(path.points[2].tilt).toBeCloseTo(-Math.PI / 4, 6)
+    expect(path.points[0].tilt).toBeCloseTo(Math.PI / 6, 6)
+    editor.destroy()
+  })
+
+  it('dissolvePoint removes the anchor and pulls neighbor handles toward the new chord', () => {
+    const scene = new Scene()
+    const camera = new PerspectiveCamera(45, 800 / 600, 0.1, 100)
+    const dom = makeHostDom()
+    const path = makeSplinePath([
+      makeSplinePoint([0, 0, 0],  [1, 0, 0]),
+      makeSplinePoint([5, 5, 0],  [1, 0, 0]),
+      makeSplinePoint([10, 0, 0], [1, 0, 0]),
+    ])
+    const editor = new ScenePathEditor(path, { scene, camera, dom, path })
+    expect(editor.dissolvePoint(1)).toBe(true)
+    expect(path.points.length).toBe(2)
+    // prev.h2 should now sit at distance ≈ chord/3 from prev.co along its
+    // original direction (still positive X). chord = sqrt(100) = 10, /3 ≈ 3.333.
+    const prev = path.points[0]
+    const dx = prev.h2[0] - prev.co[0]
+    expect(dx).toBeCloseTo(10 / 3, 4)
+    editor.destroy()
+  })
+
+  it('dissolvePoint refuses on open-spline endpoints', () => {
+    const scene = new Scene()
+    const camera = new PerspectiveCamera(45, 800 / 600, 0.1, 100)
+    const dom = makeHostDom()
+    const path = makeSplinePath([
+      makeSplinePoint([0, 0, 0]),
+      makeSplinePoint([5, 0, 0]),
+      makeSplinePoint([10, 0, 0]),
+    ])
+    const editor = new ScenePathEditor(path, { scene, camera, dom, path })
+    expect(editor.dissolvePoint(0)).toBe(false)
+    expect(editor.dissolvePoint(2)).toBe(false)
+    expect(path.points.length).toBe(3)
+    editor.destroy()
+  })
+
+  it('onCommit fires once per public mutation, with a label', () => {
+    const scene = new Scene()
+    const camera = new PerspectiveCamera(45, 800 / 600, 0.1, 100)
+    const dom = makeHostDom()
+    const path = makeSplinePath([
+      makeSplinePoint([0, 0, 0]),
+      makeSplinePoint([5, 0, 0]),
+      makeSplinePoint([10, 0, 0]),
+    ])
+    const labels: string[] = []
+    const editor = new ScenePathEditor(path, {
+      scene, camera, dom, path,
+      onCommit: (l) => labels.push(l),
+    })
+    editor.insertPoint(0, 0.5)
+    editor.setActive({ kind: 'anchor', pointIdx: 1 })
+    editor.cycleActiveHandleType()
+    editor.toggleClosed()
+    editor.toggleClosed()
+    editor.dissolvePoint(1)
+    editor.switchDirection()
+    editor.deletePoint(0)
+    expect(labels).toEqual([
+      'insert spline point',
+      'handle type → vector',
+      'close spline',
+      'open spline',
+      'dissolve spline point',
+      'switch spline direction',
+      'delete spline point',
+    ])
+    editor.destroy()
+  })
+
+  it('onCommit does NOT fire when setPointTilt is a no-op (same value)', () => {
+    const scene = new Scene()
+    const camera = new PerspectiveCamera(45, 800 / 600, 0.1, 100)
+    const dom = makeHostDom()
+    const path = makeSplinePath([
+      makeSplinePoint([0, 0, 0]),
+      makeSplinePoint([5, 0, 0]),
+    ])
+    const labels: string[] = []
+    const editor = new ScenePathEditor(path, {
+      scene, camera, dom, path,
+      onCommit: (l) => labels.push(l),
+    })
+    editor.setPointTilt(0, 0)            // no change (default tilt is 0)
+    expect(labels).toEqual([])
+    editor.setPointTilt(0, Math.PI / 4)  // real change
+    expect(labels).toEqual(['set anchor tilt'])
+    editor.destroy()
+  })
 })

@@ -1,6 +1,7 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
+import { ViewHelper } from 'three/examples/jsm/helpers/ViewHelper.js'
 import {
   CameraTrackBinding,
   GraphEditor,
@@ -24,8 +25,6 @@ import {
   makeCameraAction,
   makeFCurve,
   makePathFollowConstraint,
-  makeSplinePath,
-  makeSplinePoint,
   recalcHandlesAround,
 } from 'dollycurve'
 import type { FCurve, SharedXView } from 'dollycurve'
@@ -33,6 +32,7 @@ import type { FCurve, SharedXView } from 'dollycurve'
 const host = document.getElementById('canvas-host') as HTMLDivElement
 const endFrameInput = document.getElementById('end-frame') as HTMLInputElement
 const previewToggle = document.getElementById('preview-toggle') as HTMLInputElement
+const pipToggle = document.getElementById('pip-toggle') as HTMLInputElement
 const showHelperToggle = document.getElementById('show-helper') as HTMLInputElement
 const addBtn = document.getElementById('add-kf') as HTMLButtonElement
 const addLiveBtn = document.getElementById('add-kf-live') as HTMLButtonElement
@@ -50,12 +50,14 @@ const loadJsonInput = document.getElementById('load-json-input') as HTMLInputEle
 const graphHost = document.getElementById('graph-host') as HTMLDivElement
 const graphBottom = document.getElementById('graph-bottom') as HTMLDivElement
 const toggleGraphBtn = document.getElementById('toggle-graph') as HTMLButtonElement
-const pathModeToggle = document.getElementById('path-mode') as HTMLInputElement
-const pathControls = document.getElementById('path-controls') as HTMLDivElement
+const activeAnchorRow = document.getElementById('active-anchor-row') as HTMLDivElement
+const anchorTiltInput = document.getElementById('anchor-tilt') as HTMLInputElement
+const activeAnchorLabel = document.getElementById('active-anchor-label') as HTMLSpanElement
 const bakePathBtn = document.getElementById('bake-path') as HTMLButtonElement
 const fitPathBtn = document.getElementById('fit-path') as HTMLButtonElement
 const fitCountInput = document.getElementById('fit-count') as HTMLInputElement
 const bakeCountInput = document.getElementById('bake-count') as HTMLInputElement
+const bakeLookAtCenterToggle = document.getElementById('bake-look-at-center') as HTMLInputElement
 const gizmoEnableCheckbox = document.getElementById('gizmo-enable') as HTMLInputElement
 const gizmoRadiosEl = document.getElementById('gizmo-radios') as HTMLSpanElement
 const gizmoTranslateRadio = document.getElementById('gizmo-translate') as HTMLInputElement
@@ -91,6 +93,26 @@ previewCam.position.set(0, 2, 8)
 const controls = new OrbitControls(editorCam, renderer.domElement)
 controls.enableDamping = true
 controls.target.set(0, 1, 0)
+
+// Bottom-left axis gizmo (Blender-style ViewHelper). Click an axis to
+// snap-orbit the editor cam to that face; center is shared with
+// OrbitControls.target so the snap orbits the same point the user is.
+const viewHelper = new ViewHelper(editorCam, renderer.domElement)
+// Override defaults (bottom-right) — use bottom-left corner instead.
+;(viewHelper as unknown as { location: { top: number | null; right: number | null; bottom: number | null; left: number | null } }).location = { top: null, right: null, bottom: 8, left: 8 }
+viewHelper.center = controls.target
+viewHelper.setLabels('X', 'Y', 'Z')
+const VIEW_HELPER_DIM = 128
+renderer.domElement.addEventListener('pointerdown', (ev) => {
+  // Gate ViewHelper.handleClick to its 128px corner — it uses page coords
+  // and would otherwise capture clicks anywhere on the canvas.
+  const rect = renderer.domElement.getBoundingClientRect()
+  const localX = ev.clientX - rect.left
+  const localY = ev.clientY - rect.top
+  if (localX < 8 || localX > 8 + VIEW_HELPER_DIM) return
+  if (localY < rect.height - 8 - VIEW_HELPER_DIM || localY > rect.height - 8) return
+  if (viewHelper.handleClick(ev)) ev.stopPropagation()
+})
 
 // ---- Keyframe-pose gizmo ----
 const gizmoProxy = new THREE.Object3D()
@@ -144,6 +166,11 @@ const editorBinding = new CameraTrackBinding(editorCam, action, {
   eulerOrder: 'XYZ',
 })
 
+// Lifted ahead of the undoStack/restoreWorkspace block — applySnapshot
+// and syncSplineMode read this and they fire during initial restore,
+// before the original ---- Path mode ---- block declared it.
+let pathEditor: ScenePathEditor | null = null
+
 let endFrame = parseInt(endFrameInput.value, 10)
 let duration = endFrame / FPS
 let currentTime = 0
@@ -171,8 +198,9 @@ function syncPreviewGhost (): void {
 }
 
 function syncCamHelperVisibility (): void {
-  // Hide while looking through previewCam — frustum lines obscure the scene from inside.
+  // Frustum lines + gizmo arrows obscure the scene from inside previewCam.
   previewCamHelper.visible = showHelperToggle.checked && !previewToggle.checked
+  gizmoHelper.visible = selectedKfFrame !== null && !previewToggle.checked
 }
 syncCamHelperVisibility()
 
@@ -233,8 +261,7 @@ function writeAxisAtFrame (fcu: FCurve, frame: number, value: number): void {
 }
 
 function writeGizmoBackToFCurves (frame: number): void {
-  // Translate writes only the grabbed axis subset of `location`; rotate writes
-  // all rotation channels (axis-coupled in both quat and Euler).
+  // translate writes only the grabbed axis subset; rotate writes all channels.
   const mode = (gizmo as unknown as { mode: 'translate' | 'rotate' | 'scale' }).mode
   const axis = (gizmo as unknown as { axis: string | null }).axis ?? 'XYZ'
   const wantX = axis.includes('X')
@@ -254,7 +281,7 @@ function writeGizmoBackToFCurves (frame: number): void {
     if (hasQuat) {
       const q = gizmoProxy.quaternion
       let qx = q.x, qy = q.y, qz = q.z, qw = q.w
-      // Hemisphere continuity vs. the previous frame's sample.
+      // Hemisphere continuity vs. previous frame.
       const sample = sampleQuatAtFrame(frame - 1)
       if (sample) {
         const d = sample[0] * qx + sample[1] * qy + sample[2] * qz + sample[3] * qw
@@ -274,7 +301,7 @@ function writeGizmoBackToFCurves (frame: number): void {
     }
   }
 
-  // Continuity post-pass: prevent 360° spins between visually-identical keys.
+  // Prevent 360° spins between visually-identical keys.
   unwrapEulerInAction(action)
   alignQuaternionHemisphere(action)
 
@@ -317,7 +344,7 @@ function syncGizmoToSelection (): void {
       gizmoProxy.rotation.set(pose.euler[0], pose.euler[1], pose.euler[2])
       gizmoProxy.updateMatrixWorld()
       suppressGizmoWriteback = false
-      gizmoHelper.visible = true
+      gizmoHelper.visible = !previewToggle.checked
       if (!(gizmo as unknown as { object?: THREE.Object3D }).object) {
         gizmo.attach(gizmoProxy)
       }
@@ -537,6 +564,10 @@ const undoStack = new UndoStack<ActionSnapshot>({
     else delete action.metadata
     if (s.pathFollow) action.pathFollow = s.pathFollow
     else delete action.pathFollow
+    // ScenePathEditor closed over the OLD splinePath — rebuild against the
+    // restored pathFollow.
+    exitPathMode()
+    syncSplineMode()
     onKeyframesChanged()
     graph.reset()
   },
@@ -582,7 +613,12 @@ if (restoreWorkspace()) {
   // Refresh UI before setBaseline so baseline reflects the restored state.
   onKeyframesChanged()
   panel.refresh()
+  syncSplineMode()
 }
+bakePathBtn.disabled = !pathEditor
+bakeLookAtCenterToggle.disabled = !pathEditor
+fitPathBtn.disabled = !!pathEditor
+fitCountInput.disabled = !!pathEditor
 undoStack.setBaseline()
 
 // ---- UI state persistence ----
@@ -592,6 +628,8 @@ interface UIState {
   endFrame: number
   currentTime: number
   showCamHelper: boolean
+  previewCam: boolean
+  showPip: boolean
   graphActiveIdx: number
   graphView: { xMin: number; xMax: number; yMin: number; yMax: number }
   collapsedGroups: string[]
@@ -609,6 +647,8 @@ function captureUIState (): UIState {
     endFrame,
     currentTime,
     showCamHelper: showHelperToggle.checked,
+    previewCam: previewToggle.checked,
+    showPip: pipToggle.checked,
     graphActiveIdx: graph.getActiveFCurveIdx(),
     graphView: graph.getView(),
     collapsedGroups: graph.getCollapsedGroups(),
@@ -656,6 +696,13 @@ function restoreUIState (): void {
       showHelperToggle.checked = s.showCamHelper
       syncCamHelperVisibility()
     }
+    if (typeof s.previewCam === 'boolean') {
+      previewToggle.checked = s.previewCam
+      syncCamHelperVisibility()
+    }
+    if (typeof s.showPip === 'boolean') {
+      pipToggle.checked = s.showPip
+    }
     if (typeof s.graphOpen === 'boolean') {
       graphBottom.classList.toggle('hidden', !s.graphOpen)
       document.getElementById('bottom')?.classList.toggle('with-graph', s.graphOpen)
@@ -692,6 +739,8 @@ function restoreUIState (): void {
 
 restoreUIState()
 showHelperToggle.addEventListener('change', persistUIState)
+previewToggle.addEventListener('change', persistUIState)
+pipToggle.addEventListener('change', persistUIState)
 endFrameInput.addEventListener('change', persistUIState)
 toggleGraphBtn.addEventListener('click', persistUIState)
 
@@ -762,6 +811,7 @@ clearBtn.addEventListener('click', () => {
   action.fcurves.length = 0
   delete action.metadata
   delete action.pathFollow
+  syncSplineMode()
   onKeyframesChanged()
   undoStack.push('clear all')
 })
@@ -907,32 +957,68 @@ function tick (): void {
     graph.redraw()
   }
   controls.update()
-  // previewCam isn't in scene.children, so renderer.render() doesn't
-  // auto-recompute its matrixWorld. Sync explicitly each frame so the
-  // ghost helper (parented to a smaller stand-in camera) follows the
-  // real cam's pose without inheriting its far-plane line lengths.
+  // previewCam is off-scene; renderer.render() doesn't refresh its matrix.
   previewCam.updateMatrixWorld(true)
   syncPreviewGhost()
   updateAddLiveBtnState()
+  refreshActiveAnchorRow()
   maybePersistUIStateOnTick()
   const activeCam = previewToggle.checked ? previewCam : editorCam
   renderer.render(scene, activeCam)
+  renderPip()
+  if (viewHelper.animating) viewHelper.update(dt)
+  // ViewHelper's autoClear wipes the whole color buffer (viewport restricts
+  // draws, not the clear) — disable so only its clearDepth runs.
+  renderer.autoClear = false
+  viewHelper.render(renderer)
+  renderer.autoClear = true
   requestAnimationFrame(tick)
 }
 
-// ---- Path mode ----
+// ---- Picture-in-picture preview ----
+const PIP_W = 280
+const PIP_H = 158
+const PIP_MARGIN = 12
+const pipEl = document.getElementById('pip') as HTMLDivElement
 
-let pathEditor: ScenePathEditor | null = null
+function renderPip (): void {
+  if (!pipToggle.checked || previewToggle.checked) {
+    pipEl.style.display = 'none'
+    return
+  }
+  pipEl.style.display = 'block'
 
-function defaultSpline () {
-  return makeSplinePath([
-    makeSplinePoint([-3,  1.5,  3], [1, 0, 0]),
-    makeSplinePoint([ 0,  2.5,  0], [1, 0, -1]),
-    makeSplinePoint([ 3,  1.5, -3], [1, 0, -1]),
-  ])
+  const w = host.clientWidth
+  const h = host.clientHeight
+  const x = w - PIP_W - PIP_MARGIN
+  const y = PIP_MARGIN  // three's viewport origin is bottom-left
+
+  const savedAspect = previewCam.aspect
+  previewCam.aspect = PIP_W / PIP_H
+  previewCam.updateProjectionMatrix()
+
+  const helperWasVisible = previewCamHelper.visible
+  const gizmoWasVisible = gizmoHelper.visible
+  previewCamHelper.visible = false
+  gizmoHelper.visible = false
+
+  renderer.setScissorTest(true)
+  renderer.setViewport(x, y, PIP_W, PIP_H)
+  renderer.setScissor(x, y, PIP_W, PIP_H)
+  renderer.render(scene, previewCam)
+  renderer.setScissorTest(false)
+  renderer.setViewport(0, 0, w, h)
+
+  previewCamHelper.visible = helperWasVisible
+  gizmoHelper.visible = gizmoWasVisible
+  previewCam.aspect = savedAspect
+  previewCam.updateProjectionMatrix()
 }
 
-// Without this, the default s=frame fallback traverses the full path in ~10 frames.
+// ---- Spline mode ----
+
+// Without this the binding's default s=frame fallback traverses the full
+// path in ~10 frames at 24fps.
 function makeLinearSpeedCurve (totalLen: number, endFrame: number): ReturnType<typeof makeFCurve> {
   return makeFCurve('__path_speed', [
     makeBezTriple(0,        0,        { ipo: Interpolation.LINEAR }),
@@ -941,14 +1027,7 @@ function makeLinearSpeedCurve (totalLen: number, endFrame: number): ReturnType<t
 }
 
 function enterPathMode (): void {
-  if (pathEditor) return
-  if (!action.pathFollow) {
-    action.pathFollow = makePathFollowConstraint(defaultSpline(), {
-      orientation: 'tangent',
-      upAxis: 'Y',
-      arcLengthUniform: true,
-    })
-  }
+  if (pathEditor || !action.pathFollow) return
   const arc = buildArcTable(action.pathFollow.splinePath)
   action.pathFollow.speedCurve = makeLinearSpeedCurve(arc.totalLen, endFrame)
 
@@ -964,8 +1043,13 @@ function enterPathMode (): void {
       }
       onKeyframesChanged()
     },
+    onCommit: (label) => undoStack.push(label),
   })
-  pathControls.style.display = ''
+  bakePathBtn.disabled = false
+  bakeLookAtCenterToggle.disabled = false
+  // Re-fitting while editing would overwrite the user's anchor edits.
+  fitPathBtn.disabled = true
+  fitCountInput.disabled = true
 }
 
 function exitPathMode (): void {
@@ -973,20 +1057,112 @@ function exitPathMode (): void {
     pathEditor.destroy()
     pathEditor = null
   }
-  pathControls.style.display = 'none'
+  bakePathBtn.disabled = true
+  bakeLookAtCenterToggle.disabled = true
+  fitPathBtn.disabled = false
+  fitCountInput.disabled = false
 }
 
-pathModeToggle.addEventListener('change', () => {
-  if (pathModeToggle.checked) enterPathMode()
-  else exitPathMode()
+/** Reconcile pathEditor with action.pathFollow presence — call after any
+ * mutation that creates or removes pathFollow. */
+function syncSplineMode (): void {
+  if (action.pathFollow && !pathEditor) enterPathMode()
+  else if (!action.pathFollow && pathEditor) exitPathMode()
+}
+
+// ---- Active anchor tilt (rad on disk, deg in UI) ----
+let lastActiveSig = ''
+function refreshActiveAnchorRow (): void {
+  if (!pathEditor || !action.pathFollow) {
+    activeAnchorRow.style.display = 'none'
+    lastActiveSig = ''
+    return
+  }
+  const active = pathEditor.getActive()
+  const sig = active ? `${active.kind}:${active.pointIdx}` : ''
+  if (sig === lastActiveSig) return
+  lastActiveSig = sig
+  if (!active) {
+    activeAnchorRow.style.display = 'none'
+    return
+  }
+  const p = action.pathFollow.splinePath.points[active.pointIdx]
+  if (!p) {
+    activeAnchorRow.style.display = 'none'
+    return
+  }
+  activeAnchorRow.style.display = ''
+  const radians = p.tilt ?? 0
+  anchorTiltInput.value = String(+(radians * 180 / Math.PI).toFixed(2))
+  activeAnchorLabel.textContent = `point ${active.pointIdx}`
+}
+
+anchorTiltInput.addEventListener('change', () => {
+  if (!pathEditor || !action.pathFollow) return
+  const active = pathEditor.getActive()
+  if (!active) return
+  const deg = parseFloat(anchorTiltInput.value)
+  const radians = Number.isFinite(deg) ? deg * Math.PI / 180 : 0
+  pathEditor.setPointTilt(active.pointIdx, radians)
+})
+
+// Spline-mode keyboard ops. undoStack is wired via the editor's onCommit,
+// so we just forward keys here.
+window.addEventListener('keydown', (e) => {
+  if (!pathEditor) return
+  if (e.target instanceof HTMLInputElement) return
+  const active = pathEditor.getActive()
+  const isDelete = e.key === 'x' || e.key === 'X' || e.key === 'Delete' || e.key === 'Backspace'
+  if (isDelete && e.ctrlKey && active?.kind === 'anchor') {
+    pathEditor.dissolvePoint(active.pointIdx)
+    e.preventDefault()
+  } else if (isDelete && active?.kind === 'anchor') {
+    pathEditor.deletePoint(active.pointIdx)
+    e.preventDefault()
+  } else if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.altKey) {
+    pathEditor.switchDirection()
+    e.preventDefault()
+  } else if ((e.key === 'v' || e.key === 'V') && active) {
+    pathEditor.cycleActiveHandleType()
+    e.preventDefault()
+  } else if ((e.key === 'c' || e.key === 'C') && e.altKey) {
+    pathEditor.toggleClosed()
+    e.preventDefault()
+  } else if ((e.key === 'e' || e.key === 'E') && active?.kind === 'anchor') {
+    pathEditor.extrudeFromActiveEndpoint()
+    e.preventDefault()
+  } else if ((e.key === 't' || e.key === 'T') && e.altKey && active?.kind === 'anchor') {
+    pathEditor.setPointTilt(active.pointIdx, 0)
+    anchorTiltInput.value = '0'
+    e.preventDefault()
+  } else if (e.key === 'Escape' || e.key === 'Esc') {
+    if (active) {
+      pathEditor.setActive(null)
+      e.preventDefault()
+    }
+  }
 })
 
 bakePathBtn.addEventListener('click', () => {
   if (!action.pathFollow) return
-  const targetCount = Math.max(2, parseInt(bakeCountInput.value, 10) || 20)
-  bakePathToFCurves(action, { startFrame: 0, endFrame: endFrame, targetCount })
-  exitPathMode()
-  pathModeToggle.checked = false
+  // Blank input → useSplineAnchors (round-trips Fit → Path); ≥2 → resample.
+  const raw = parseInt(bakeCountInput.value, 10)
+  const targetCount = Number.isFinite(raw) && raw >= 2 ? raw : undefined
+  if (bakeLookAtCenterToggle.checked) {
+    action.pathFollow.orientation = 'lookAt'
+    action.pathFollow.lookAtTarget = action.metadata?.subjectTarget
+      ? [...action.metadata.subjectTarget]
+      : [0, 0, 0]
+  }
+  bakePathToFCurves(action, {
+    startFrame: 0,
+    endFrame: endFrame,
+    targetCount,
+    useSplineAnchors: targetCount === undefined,
+    // Match insertVec3Key / binding eulerOrder elsewhere in the playground.
+    rotationMode: 'XYZ',
+  })
+  syncSplineMode()
   onKeyframesChanged()
   panel.refresh()
   undoStack.push('bake path → fcurves')
@@ -994,21 +1170,17 @@ bakePathBtn.addEventListener('click', () => {
 
 fitPathBtn.addEventListener('click', () => {
   try {
-    const targetCount = Math.max(2, parseInt(fitCountInput.value, 10) || 5)
+    // Blank input → 1 anchor per keyframe; ≥2 → uniform resample.
+    const raw = parseInt(fitCountInput.value, 10)
+    const targetCount = Number.isFinite(raw) && raw >= 2 ? raw : undefined
     const path = fitFCurvesToPath(action, { consumeFCurves: true, targetCount })
     action.pathFollow = makePathFollowConstraint(path, {
       orientation: 'tangent', upAxis: 'Y', arcLengthUniform: true,
     })
     onKeyframesChanged()
     panel.refresh()
-    if (!pathEditor) {
-      pathModeToggle.checked = true
-      enterPathMode()
-    } else {
-      exitPathMode()
-      pathModeToggle.checked = true
-      enterPathMode()
-    }
+    exitPathMode()
+    syncSplineMode()
     undoStack.push('fit fcurves → path')
   } catch (e) {
     alert('Fit failed: ' + (e instanceof Error ? e.message : String(e)))

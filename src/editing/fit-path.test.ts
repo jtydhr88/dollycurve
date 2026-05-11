@@ -95,6 +95,40 @@ describe('fitFCurvesToPath', () => {
     expect(path.points[4].co[0]).toBeCloseTo(99 * 0.1, 4)
   })
 
+  it('useFCurveHandles=true reads h2 directly from each axis bezt', () => {
+    // X-axis right handle at (5, 8) on the key at frame 0, gap to next = 10.
+    // Slope = (8-0)/(5-0) = 1.6 per frame; expected h2.x = 0 + 1.6*10/3 = 5.333.
+    const xKey0 = makeBezTriple(0,  0)
+    xKey0.vec[2] = [5, 8]   // override right handle
+    const yKey0 = makeBezTriple(0, 0)
+    const zKey0 = makeBezTriple(0, 0)
+    const action = makeCameraAction([
+      makeFCurve('location', [xKey0, makeBezTriple(10, 5)], { arrayIndex: 0 }),
+      makeFCurve('location', [yKey0, makeBezTriple(10, 0)], { arrayIndex: 1 }),
+      makeFCurve('location', [zKey0, makeBezTriple(10, 0)], { arrayIndex: 2 }),
+    ], 24)
+    const path = fitFCurvesToPath(action, { consumeFCurves: false })
+    expect(path.points[0].h2[0]).toBeCloseTo(8 / 5 * 10 / 3, 4)
+    expect(path.points[0].h2[1]).toBeCloseTo(0, 4)
+    expect(path.points[0].h2[2]).toBeCloseTo(0, 4)
+  })
+
+  it('useFCurveHandles=false falls back to central-difference tangents', () => {
+    const xKey0 = makeBezTriple(0,  0)
+    xKey0.vec[2] = [5, 8]   // would normally bias h2 strongly
+    const yKey0 = makeBezTriple(0, 0)
+    const zKey0 = makeBezTriple(0, 0)
+    const action = makeCameraAction([
+      makeFCurve('location', [xKey0, makeBezTriple(10, 5)], { arrayIndex: 0 }),
+      makeFCurve('location', [yKey0, makeBezTriple(10, 0)], { arrayIndex: 1 }),
+      makeFCurve('location', [zKey0, makeBezTriple(10, 0)], { arrayIndex: 2 }),
+    ], 24)
+    const pathLegacy = fitFCurvesToPath(action, { consumeFCurves: false, useFCurveHandles: false })
+    const pathHandles = fitFCurvesToPath(action, { consumeFCurves: false, useFCurveHandles: true })
+    // The two strategies must produce different h2 for the first anchor.
+    expect(pathLegacy.points[0].h2[0]).not.toBeCloseTo(pathHandles.points[0].h2[0], 2)
+  })
+
   it('minFrame/maxFrame clips the fit window', () => {
     const action = makeCameraAction([
       makeFCurve('location', [

@@ -41,6 +41,8 @@ export interface SplinePointJson {
   co: [number, number, number]
   h1: [number, number, number]
   h2: [number, number, number]
+  h1Type?: string  // HandleType enum value; omitted means AUTO
+  h2Type?: string
   tilt?: number
 }
 
@@ -163,6 +165,9 @@ function splinePointToJson (p: SplinePoint): SplinePointJson {
     h1: [p.h1[0], p.h1[1], p.h1[2]],
     h2: [p.h2[0], p.h2[1], p.h2[2]],
   }
+  // Omit AUTO (the default semantic) so v1 readers see the same shape.
+  if (p.h1Type !== undefined && p.h1Type !== HandleType.AUTO) out.h1Type = p.h1Type
+  if (p.h2Type !== undefined && p.h2Type !== HandleType.AUTO) out.h2Type = p.h2Type
   if (p.tilt !== undefined && p.tilt !== 0) out.tilt = p.tilt
   return out
 }
@@ -343,8 +348,17 @@ function splinePointFromJson (raw: unknown, path: string): SplinePoint {
     h1: readVec3(o.h1, `${path}.h1`),
     h2: readVec3(o.h2, `${path}.h2`),
   }
+  if (o.h1Type !== undefined) out.h1Type = parseHandleType(o.h1Type, `${path}.h1Type`)
+  if (o.h2Type !== undefined) out.h2Type = parseHandleType(o.h2Type, `${path}.h2Type`)
   if (o.tilt !== undefined) out.tilt = expectFiniteNumber(o.tilt, `${path}.tilt`)
   return out
+}
+
+function parseHandleType (raw: unknown, path: string): HandleType {
+  if (typeof raw !== 'string') throw new Error(`${path}: expected string, got ${typeof raw}`)
+  const valid = Object.values(HandleType) as string[]
+  if (!valid.includes(raw)) throw new Error(`${path}: unknown handle type "${raw}"`)
+  return raw as HandleType
 }
 
 function metadataFromJson (raw: unknown, path: string): CameraActionMetadata {

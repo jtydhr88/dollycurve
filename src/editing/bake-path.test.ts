@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { PerspectiveCamera } from 'three'
+import { Interpolation } from '../data/enums'
 import {
   makeCameraAction,
   makePathFollowConstraint,
@@ -105,5 +106,65 @@ describe('bakePathToFCurves', () => {
   it('throws when action has no pathFollow', () => {
     const action = makeCameraAction([], 24)
     expect(() => bakePathToFCurves(action, { startFrame: 0, endFrame: 5 })).toThrow(/pathFollow/)
+  })
+
+  it('useSplineAnchors emits one keyframe per anchor at the anchor\'s position', () => {
+    const action = makeCameraAction([], 24)
+    action.pathFollow = makePathFollowConstraint(makeSplinePath([
+      makeSplinePoint([0,  0, 0], [1, 0, 0]),
+      makeSplinePoint([5,  3, 0], [1, 0, 0]),
+      makeSplinePoint([10, 0, 0], [1, 0, 0]),
+    ]), { arcLengthUniform: true })
+    bakePathToFCurves(action, { startFrame: 0, endFrame: 24, useSplineAnchors: true })
+    const x = action.fcurves.find((f) => f.rnaPath === 'location' && f.arrayIndex === 0)!
+    const y = action.fcurves.find((f) => f.rnaPath === 'location' && f.arrayIndex === 1)!
+    expect(x.bezt.length).toBe(3)  // one key per anchor
+    // Anchor positions land exactly (within bezier-eval tolerance).
+    expect(x.bezt[0].vec[1][1]).toBeCloseTo(0, 3)
+    expect(x.bezt[1].vec[1][1]).toBeCloseTo(5, 3)
+    expect(x.bezt[2].vec[1][1]).toBeCloseTo(10, 3)
+    expect(y.bezt[0].vec[1][1]).toBeCloseTo(0, 3)
+    expect(y.bezt[1].vec[1][1]).toBeCloseTo(3, 3)
+  })
+
+  it('useSplineAnchors emits BEZIER ipo with handles mirroring the 3D spline', () => {
+    const action = makeCameraAction([], 24)
+    // Custom spline with NON-trivial handles: anchor at (5, 5, 0) with
+    // h2 pulled to (8, 5, 0) so the 3D X-bezier is not a straight line.
+    const spline = makeSplinePath([
+      makeSplinePoint([0, 0, 0], [1, 0, 0]),
+      makeSplinePoint([5, 5, 0], [1, 0, 0]),
+      makeSplinePoint([10, 0, 0], [1, 0, 0]),
+    ])
+    spline.points[1].h2 = [8, 5, 0]   // exaggerated outgoing handle
+    spline.points[1].h1 = [2, 5, 0]   // exaggerated incoming handle (mirror)
+    action.pathFollow = makePathFollowConstraint(spline, { arcLengthUniform: true })
+    bakePathToFCurves(action, { startFrame: 0, endFrame: 24, useSplineAnchors: true })
+
+    const x = action.fcurves.find((f) => f.rnaPath === 'location' && f.arrayIndex === 0)!
+    // All keys should be BEZIER (not LINEAR).
+    for (const b of x.bezt) {
+      expect(b.ipo).toBe(Interpolation.BEZIER)
+    }
+    // Middle anchor's right handle value should equal the 3D h2's X.
+    expect(x.bezt[1].vec[2][1]).toBeCloseTo(8, 6)
+    // Middle anchor's left handle value should equal the 3D h1's X.
+    expect(x.bezt[1].vec[0][1]).toBeCloseTo(2, 6)
+  })
+
+  it('useSplineAnchors first/last keyframes pin to startFrame/endFrame for arc-uniform paths', () => {
+    const action = makeCameraAction([], 24)
+    action.pathFollow = makePathFollowConstraint(makeSplinePath([
+      makeSplinePoint([0,  0, 0], [1, 0, 0]),
+      makeSplinePoint([5,  0, 0], [1, 0, 0]),
+      makeSplinePoint([10, 0, 0], [1, 0, 0]),
+    ]), { arcLengthUniform: true })
+    bakePathToFCurves(action, { startFrame: 5, endFrame: 35, useSplineAnchors: true })
+    const x = action.fcurves.find((f) => f.rnaPath === 'location' && f.arrayIndex === 0)!
+    expect(x.bezt[0].vec[1][0]).toBeCloseTo(5, 1)   // first anchor → startFrame
+    expect(x.bezt[2].vec[1][0]).toBeCloseTo(35, 1)  // last anchor → endFrame
+    // Middle anchor should land roughly mid-range (anchors are uniform here).
+    expect(x.bezt[1].vec[1][0]).toBeGreaterThan(15)
+    expect(x.bezt[1].vec[1][0]).toBeLessThan(25)
   })
 })
